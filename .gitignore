@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+models/*.pt
+models/*.pth
+models/*.onnx
+models/*.pkl
+models/L2CSNet/
+*.egg-info/
+dist/
+build/
+.eggs/
+data/
+rendering_output/
+outputs/
