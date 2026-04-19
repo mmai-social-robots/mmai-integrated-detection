@@ -50,6 +50,11 @@ class PoseResult:
     interaction_z_meters: Optional[float] = None
     closest_wrist_px: Optional[tuple[int, int]] = None
     has_pose: bool = True
+    # Raw signals — surfaced so detection thresholds can be tuned offline without
+    # re-running MediaPipe. See scripts/extract_features.py (calibration Stage A).
+    hand_to_mouth_ratio: Optional[float] = None  # min_wrist_to_nose_dist / shoulder_width
+    z_displacement_m: Optional[float] = None     # end-of-history minus start-of-history depth
+    posture_drop: Optional[float] = None         # start-of-history minus end-of-history open-posture
 
 
 @dataclass

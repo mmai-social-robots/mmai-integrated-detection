@@ -5,6 +5,7 @@ from .detectors.emotion_detector import EmotionDetector
 from .detectors.gaze_detector import GazeDetector
 from .detectors.pose_detector import PoseDetector
 from .comfort import IntegratedComfortScorer
+from .phases import Phase
 from .types import FrameResult
 
 
@@ -38,6 +39,18 @@ class IntegratedPipeline:
         self.pose_detector.reset_state()
         self.comfort_scorer.reset()
 
+    def set_phase(self, phase: Phase) -> None:
+        """Drive phase-aware comfort scoring.
+
+        Calibration drives this from sidecar keypoints; the robot controller drives
+        it from its own state machine (intent signaling vs service execution).
+        """
+        self.comfort_scorer.set_phase(phase)
+
+    @property
+    def phase(self) -> Phase:
+        return self.comfort_scorer.phase
+
     def process_frame(self, color_frame: np.ndarray, timestamp_ms: float = 0.0,
                       depth_frame=None) -> FrameResult:
         result = FrameResult(timestamp_ms=timestamp_ms)
@@ -58,7 +71,8 @@ class IntegratedPipeline:
         result.pose = self.pose_detector.predict(color_frame, depth_frame=depth_frame)
 
         # --- Combined scoring ---
-        emotion_score, posture_score, integrated_score = self.comfort_scorer.update(result)
+        timestamp_s = timestamp_ms / 1000.0
+        emotion_score, posture_score, integrated_score = self.comfort_scorer.update(result, timestamp_s)
         result.emotion_comfort_score = emotion_score
         result.posture_comfort_score = posture_score
         result.integrated_comfort_score = integrated_score

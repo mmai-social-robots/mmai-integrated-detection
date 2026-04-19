@@ -32,19 +32,41 @@ pose_detector:
   posture_drop_threshold: 0.15
 
 # --- Integrated comfort scoring ---
+# Fusion weights are phase-dependent. Phase is set externally via
+# IntegratedPipeline.set_phase("approach" | "intent" | "execution").
+#
+# Calibration (scripts/calibrate.py) tunes these by replaying sidecar-labeled
+# recordings. The robot controller (§7.3) drives phase from its state machine.
+#
+# Rationale for defaults:
+#   - intent:    gaze_weight is high — looking at the robot signals engagement.
+#   - execution: gaze_weight is near-zero — the user naturally looks at the object,
+#                not the robot; posture/depth carry the comfort signal.
+#   - approach:  unused in calibration (pre-interaction), neutral defaults.
 comfort:
   gamma: 0.5
   delta: 0.3
-  gaze_weight: 0.6
   mouth_cover_penalty: 30.0
   withdrawal_penalty: 25.0
-  emotion_weight: 0.55
-  posture_weight: 0.45
-  ema_lambda: 0.85
-  no_face_decay_rate: 0.005
+  ema_time_constant_s: 0.5
+  phase_warmup_s: 0.3
+  no_face_decay_rate: 0.15       # per-second decay toward no_face_decay_target
   no_face_decay_target: 35.0
-  no_pose_decay_rate: 0.01
+  no_pose_decay_rate: 0.30
   no_pose_decay_target: 50.0
+  phase_weights:
+    approach:
+      emotion_weight: 0.5
+      posture_weight: 0.5
+      gaze_weight: 0.3
+    intent:
+      emotion_weight: 0.6
+      posture_weight: 0.4
+      gaze_weight: 0.6
+    execution:
+      emotion_weight: 0.35
+      posture_weight: 0.65
+      gaze_weight: 0.1
 
 # --- Visualization ---
 visualization:
@@ -56,6 +78,7 @@ visualization:
   show_depth_marker: true
   show_state_warnings: true
   show_fps: true
+  show_phase: true
   bbox_thickness: 2
 
 device: "cuda:0"

@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.pipeline import IntegratedPipeline
 from src.bag_source import BagSource
+from src.phases import find_sidecar, phase_at, windows_from_sidecar
 from src.visualization import Visualizer
 
 
@@ -61,8 +62,8 @@ def find_bag_files(path: Path) -> list[Path]:
 
 
 def load_sidecar(bag_path: Path) -> dict | None:
-    json_path = bag_path.with_suffix(".json")
-    if json_path.exists():
+    json_path = find_sidecar(bag_path)
+    if json_path is not None:
         with open(json_path) as f:
             return json.load(f)
     return None
@@ -83,6 +84,21 @@ def process_bag(bag_path: Path, pipeline: IntegratedPipeline, viz: Visualizer,
     print(f"{'='*60}")
 
     pipeline.reset_state()
+
+    sidecar_path = find_sidecar(bag_path)
+    windows = windows_from_sidecar(sidecar_path) if sidecar_path is not None else None
+    if windows is None:
+        pipeline.set_phase("intent")  # sensible default when no sidecar exists
+
+    interaction_start_s = windows.approach[0] if windows and windows.approach else None
+    if windows and windows.execution:
+        interaction_end_s = windows.execution[1]
+    elif windows and windows.intent:
+        interaction_end_s = windows.intent[1]
+    else:
+        interaction_end_s = None
+    if interaction_start_s is not None and interaction_end_s is not None:
+        print(f"  interaction window: [{interaction_start_s:.2f}s, {interaction_end_s:.2f}s]")
 
     source = BagSource(str(bag_path), real_time=(not headless and not save))
     if not source.open():
@@ -109,6 +125,15 @@ def process_bag(bag_path: Path, pipeline: IntegratedPipeline, viz: Visualizer,
             if not ret or frame is None:
                 break
 
+            t_s = timestamp_ms / 1000.0
+            if interaction_start_s is not None and t_s < interaction_start_s:
+                continue
+            if interaction_end_s is not None and t_s > interaction_end_s:
+                break
+
+            if windows is not None:
+                pipeline.set_phase(phase_at(windows, t_s))
+
             result = pipeline.process_frame(frame, timestamp_ms, depth_frame=depth_frame)
             frame_count += 1
 
@@ -117,8 +142,8 @@ def process_bag(bag_path: Path, pipeline: IntegratedPipeline, viz: Visualizer,
                 display = viz.draw(frame, result)
                 cv2.putText(display, f"{label}/{lighting}", (20, display.shape[0] - 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-                elapsed_s = timestamp_ms / 1000.0
-                cv2.putText(display, f"t={elapsed_s:.1f}s  frame={frame_count}",
+                phase_str = f"  phase={pipeline.phase}" if windows is not None else ""
+                cv2.putText(display, f"t={t_s:.1f}s  frame={frame_count}{phase_str}",
                             (20, display.shape[0] - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
@@ -163,7 +188,7 @@ def main():
         help="Path to a .bag file or directory (default: data/)")
     parser.add_argument(
         "--config", type=str,
-        default=str(PROJECT_ROOT / "config" / "default.yaml"),
+        default=str(PROJECT_ROOT / "config" / "deploy.yaml"),
         help="Path to config YAML file")
     parser.add_argument(
         "--headless", action="store_true",
@@ -196,17 +221,24 @@ def main():
 
     print(f"\n   0) Run ALL files\n")
 
-    while True:
-        try:
-            choice = input("Select file(s) (e.g. 3 or 1,4,7 or 2-5 or 0 for all): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nCancelled.")
-            sys.exit(0)
+    # Non-interactive: single .bag file given → run it without prompting.
+    # Also skip prompt when headless (e.g. overnight/automated runs).
+    if input_path.is_file() and input_path.suffix == ".bag":
+        selected = bags
+    elif args.headless or args.save:
+        selected = bags
+    else:
+        while True:
+            try:
+                choice = input("Select file(s) (e.g. 3 or 1,4,7 or 2-5 or 0 for all): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.")
+                sys.exit(0)
 
-        selected = _parse_selection(choice, bags)
-        if selected is not None:
-            break
-        print(f"Invalid input. Enter 0-{len(bags)}, a comma-separated list, or a range.")
+            selected = _parse_selection(choice, bags)
+            if selected is not None:
+                break
+            print(f"Invalid input. Enter 0-{len(bags)}, a comma-separated list, or a range.")
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
@@ -214,7 +246,7 @@ def main():
     pipeline = IntegratedPipeline(config)
     pipeline.load_models()
 
-    viz = Visualizer(config.get("visualization", {}))
+    viz = Visualizer(config)
 
     try:
         for i, bag_path in enumerate(selected):

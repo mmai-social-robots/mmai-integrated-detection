@@ -6,19 +6,50 @@ import numpy as np
 from .types import FrameResult
 
 
+# Color anchors for comfort bar (BGR). Designed around the calibrated τ*=80:
+#   <65   firm abort / walk-by baseline   red
+#    80   τ* marginal                     yellow-green
+#    85   clear comfort                   teal-green
+# Piecewise-linear lerp between anchors prevents HUD flicker near band edges.
+_COMFORT_ANCHORS: tuple[tuple[float, tuple[int, int, int]], ...] = (
+    (0.0,   (60,  60,  230)),   # red
+    (65.0,  (0,   140, 255)),   # amber
+    (80.0,  (120, 220, 180)),   # yellow-green (marginal, at τ*)
+    (85.0,  (180, 200, 0)),     # teal-green (clear comfort)
+    (100.0, (180, 200, 0)),     # hold teal-green above 85
+)
+
+
+def _lerp_comfort_color(score: float) -> tuple[int, int, int]:
+    s = max(0.0, min(100.0, float(score)))
+    for (x0, c0), (x1, c1) in zip(_COMFORT_ANCHORS, _COMFORT_ANCHORS[1:]):
+        if s <= x1:
+            t = (s - x0) / (x1 - x0) if x1 > x0 else 0.0
+            return (
+                int(round(c0[0] + t * (c1[0] - c0[0]))),
+                int(round(c0[1] + t * (c1[1] - c0[1]))),
+                int(round(c0[2] + t * (c1[2] - c0[2]))),
+            )
+    return _COMFORT_ANCHORS[-1][1]
+
+
 class Visualizer:
     """Draws combined emotion + posture overlays on frames."""
 
     def __init__(self, config: dict):
-        self.show_bbox = config.get("show_bbox", True)
-        self.show_comfort_bar = config.get("show_comfort_bar", True)
-        self.show_emotion_text = config.get("show_emotion_text", True)
-        self.show_gaze_text = config.get("show_gaze_text", True)
-        self.show_posture_text = config.get("show_posture_text", True)
-        self.show_depth_marker = config.get("show_depth_marker", True)
-        self.show_state_warnings = config.get("show_state_warnings", True)
-        self.show_fps = config.get("show_fps", True)
-        self.bbox_thickness = config.get("bbox_thickness", 2)
+        viz_cfg = config.get("visualization", config)
+        self.show_bbox = viz_cfg.get("show_bbox", True)
+        self.show_comfort_bar = viz_cfg.get("show_comfort_bar", True)
+        self.show_emotion_text = viz_cfg.get("show_emotion_text", True)
+        self.show_gaze_text = viz_cfg.get("show_gaze_text", True)
+        self.show_posture_text = viz_cfg.get("show_posture_text", True)
+        self.show_depth_marker = viz_cfg.get("show_depth_marker", True)
+        self.show_state_warnings = viz_cfg.get("show_state_warnings", True)
+        self.show_fps = viz_cfg.get("show_fps", True)
+        self.bbox_thickness = viz_cfg.get("bbox_thickness", 2)
+        self.abort_threshold = float(
+            config.get("comfort", {}).get("abort_threshold", 80.0)
+        )
         self._prev_time = time.time()
         self._fps = 0.0
 
@@ -30,13 +61,7 @@ class Visualizer:
         self._prev_time = now
 
     def _comfort_color(self, score: float) -> tuple[int, int, int]:
-        """Green > 60, Yellow 30-60, Red < 30 (BGR)."""
-        if score > 60:
-            return (0, 200, 0)
-        elif score > 30:
-            return (0, 200, 200)
-        else:
-            return (0, 0, 200)
+        return _lerp_comfort_color(score)
 
     def draw(self, frame: np.ndarray, result: FrameResult) -> np.ndarray:
         self._update_fps()
@@ -51,11 +76,15 @@ class Visualizer:
             bar_x, bar_y = 20, 30
             bar_w, bar_h = 200, 25
             cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
-            fill_w = int(bar_w * score / 100.0)
+            fill_w = int(bar_w * max(0.0, min(100.0, score)) / 100.0)
             cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), color, -1)
             cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (200, 200, 200), 1)
-            cv2.putText(overlay, f"Comfort: {score:.0f}/100", (bar_x, bar_y - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            tau_x = bar_x + int(bar_w * self.abort_threshold / 100.0)
+            cv2.line(overlay, (tau_x, bar_y - 3), (tau_x, bar_y + bar_h + 3),
+                     (255, 255, 255), 1)
+            cv2.putText(overlay, f"Comfort: {score:.0f}/100  (abort<={self.abort_threshold:.0f})",
+                        (bar_x, bar_y - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         # --- Face bounding box ---
         if self.show_bbox and result.face_bbox is not None:

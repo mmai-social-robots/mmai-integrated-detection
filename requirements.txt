@@ -15,3 +15,8 @@ pyyaml>=6.0
 Pillow>=10.0.0
 gdown>=5.0.0
 pyrealsense2>=2.50.0
+
+# Calibration pipeline (scripts/calibrate.py and friends)
+pandas>=2.0.0
+pyarrow>=14.0.0
+scipy>=1.10.0

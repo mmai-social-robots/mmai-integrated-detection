@@ -88,16 +88,23 @@ class PoseDetector(BaseDetector):
         dist_l_face = math.dist([l_wrist.x, l_wrist.y], [nose.x, nose.y])
         dist_r_face = math.dist([r_wrist.x, r_wrist.y], [nose.x, nose.y])
         min_face_dist = min(dist_l_face, dist_r_face)
-        is_covering_mouth = min_face_dist < (shoulder_width * self.face_cover_ratio)
+        hand_to_mouth_ratio = min_face_dist / (shoulder_width + 1e-6)
+        is_covering_mouth = hand_to_mouth_ratio < self.face_cover_ratio
 
         interaction_z_meters = None
         closest_wrist_px = None
         is_withdrawing = False
+        z_displacement_m: float | None = None
+        posture_drop: float | None = None
 
         if depth_frame is not None:
-            interaction_z_meters, closest_wrist_px, is_withdrawing = self._detect_withdrawal(
-                image.shape, depth_frame, [l_wrist, r_wrist]
-            )
+            (
+                interaction_z_meters,
+                closest_wrist_px,
+                is_withdrawing,
+                z_displacement_m,
+                posture_drop,
+            ) = self._detect_withdrawal(image.shape, depth_frame, [l_wrist, r_wrist])
 
         return PoseResult(
             open_posture_score=open_posture_score,
@@ -106,6 +113,9 @@ class PoseDetector(BaseDetector):
             interaction_z_meters=interaction_z_meters,
             closest_wrist_px=closest_wrist_px,
             has_pose=True,
+            hand_to_mouth_ratio=hand_to_mouth_ratio,
+            z_displacement_m=z_displacement_m,
+            posture_drop=posture_drop,
         )
 
     def _detect_withdrawal(
@@ -113,7 +123,7 @@ class PoseDetector(BaseDetector):
         image_shape: tuple[int, ...],
         depth_frame: Any,
         wrists: list[Any],
-    ) -> tuple[float | None, tuple[int, int] | None, bool]:
+    ) -> tuple[float | None, tuple[int, int] | None, bool, float | None, float | None]:
         h, w = image_shape[:2]
         valid_depths: list[tuple[float, int, int]] = []
 
@@ -125,7 +135,7 @@ class PoseDetector(BaseDetector):
                     valid_depths.append((z, px_x, px_y))
 
         if not valid_depths:
-            return None, None, False
+            return None, None, False, None, None
 
         valid_depths.sort(key=lambda item: item[0])
         closest_z, px_x, px_y = valid_depths[0]
@@ -137,6 +147,8 @@ class PoseDetector(BaseDetector):
 
         self._interaction_z_history.append(closest_z)
         is_withdrawing = False
+        z_displacement: float | None = None
+        posture_drop: float | None = None
 
         if (
             len(self._interaction_z_history) == self._interaction_z_history.maxlen
@@ -150,12 +162,13 @@ class PoseDetector(BaseDetector):
             posture_list = list(self._posture_history)
             start_posture = sum(posture_list[:3]) / 3.0
             end_posture = sum(posture_list[-3:]) / 3.0
-            is_crossing_arms = (start_posture - end_posture) > self.posture_drop_threshold
+            posture_drop = start_posture - end_posture
+            is_crossing_arms = posture_drop > self.posture_drop_threshold
 
             if z_displacement > self.withdrawal_threshold_meters and not is_crossing_arms:
                 is_withdrawing = True
 
-        return closest_z, (px_x, px_y), is_withdrawing
+        return closest_z, (px_x, px_y), is_withdrawing, z_displacement, posture_drop
 
     @staticmethod
     def _clamp(value: float, min_value: float = 0.0, max_value: float = 1.0) -> float:

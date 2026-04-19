@@ -17,10 +17,13 @@ RealSense .bag (color + depth)
         │       └──► Depth-based Withdrawal Detection
         │
         └──► Integrated Comfort Scorer
-                ├──► Emotion Comfort (55%)
-                ├──► Posture Comfort (45%)
-                └──► Unified Score (0-100, EMA-smoothed)
+                ├──► Phase-aware fusion (approach / intent / execution)
+                ├──► Per-phase weights over emotion, gaze, posture channels
+                ├──► Missing-detection decay toward tunable targets
+                └──► Unified Score (0-100, EMA-smoothed) + abort threshold τ*
 ```
+
+Fusion weights are phase-dependent and calibrated by differential evolution against held-out recordings (see [Calibration](#calibration)). The deployed config (`config/deploy.yaml`) sets `posture_weight = 0` in both intent and execution phases — see [reports/default_vs_deploy.md](reports/default_vs_deploy.md) for why.
 
 ## Setup
 
@@ -80,6 +83,8 @@ ln -s /path/to/mmai-emotion-detection/data data
 python scripts/run_bag.py
 ```
 
+Uses `config/deploy.yaml` (the calibrated config) by default. Pass `--config config/default.yaml` to run against the uncalibrated baseline.
+
 Select files interactively. Controls:
 - `q` — quit
 - `n` — skip to next file
@@ -131,24 +136,55 @@ At the interactive prompt, enter:
 
 ## Configuration
 
-All parameters are in `config/default.yaml`. Key sections:
+Two configs ship with the repo:
+- `config/default.yaml` — hand-set baseline, never calibrated.
+- `config/deploy.yaml` — the calibrated config used at runtime. Produced by the calibration pipeline below.
+
+Key sections (identical schema in both):
 
 | Section | Description |
 |---------|-------------|
 | `face_detector` | RetinaFace confidence threshold, bbox expansion |
 | `emotion_detector` | EfficientNet model, input size |
 | `gaze_detector` | L2CS-Net yaw/pitch thresholds |
-| `pose_detector` | MediaPipe settings, posture thresholds, depth/withdrawal params |
-| `comfort` | Scoring weights, EMA smoothing, decay rates |
+| `pose_detector` | MediaPipe settings, face-cover ratio, withdrawal threshold, posture-drop gate |
+| `comfort` | Per-phase fusion weights, gamma/delta, EMA time constant, mouth-cover and withdrawal penalties, missing-detection decay targets, `abort_threshold` (τ*) |
 | `visualization` | Toggle individual overlay elements |
 
 ## Comfort Scoring
 
 **Emotion comfort** (0-100): Based on valence, arousal, and gaze engagement.
 
-**Posture comfort** (0-100): Based on open posture score, with penalties for mouth covering (-30) and sudden withdrawal (-25).
+**Posture comfort** (0-100): Based on open posture score, with penalties for mouth covering and sudden withdrawal. Still computed; surfaces on the HUD as state warnings and the side-panel posture score.
 
-**Integrated comfort**: Weighted blend — 55% emotion, 45% posture — with independent EMA smoothing per component.
+**Integrated comfort**: Phase-weighted blend of emotion, gaze, and posture channels, with independent EMA smoothing per component. Weights are set per phase (`approach` / `intent` / `execution`) and calibrated against labeled recordings. Under the deployed config, posture weight is 0 in both intent and execution (see [reports/default_vs_deploy.md](reports/default_vs_deploy.md) for the rationale) — the abort decision runs on emotion + gaze, with missing-detection decay providing a baseline pull when the face or pose drops out.
+
+## Calibration
+
+Calibration is a four-stage pipeline orchestrated by `scripts/calibrate.py`:
+
+```bash
+python scripts/calibrate.py split      # 75/25 stratified train/test (data/split.json)
+python scripts/calibrate.py extract    # runs vision models once, caches features
+python scripts/calibrate.py optimize   # differential-evolution search → config/deploy.yaml
+python scripts/calibrate.py evaluate   # held-out evaluation → reports/calibration_report.json
+```
+
+Once `extract` has produced cached parquets, `optimize` and `evaluate` run without the GPU — iterating on the objective function takes seconds per configuration, not minutes.
+
+**Objective variants** (select via `scripts/optimize_params.py --objective`): `A` mean+J baseline, `B` mean-late, `C` delta, `F` J+sc02-shape, `G` J+all-scenario-shape, `I` sc02-guarded shape. `scripts/race_objectives.py` races a chosen set and picks a winner.
+
+**Ablations:** `scripts/optimize_params.py --pin-wp 0.0` pins posture weights to zero (used to confirm pose was net-negative under the current domain shift).
+
+**Full-dataset sanity check:** `scripts/loro_eval.py --config CONFIG --report reports/loro_X.json` replays all 31 recordings against a given config and reports per-scenario slope-sign agreement.
+
+Every run archives to `reports/` with a timestamped filename; `reports/RUNS.md` indexes them.
+
+## Reports and writeup material
+
+- `reports/RUNS.md` — index of every calibration run with headline metrics and notes.
+- `reports/default_vs_deploy.md` — side-by-side comparison of the uncalibrated default config against the deployed calibrated config on the held-out test and LORO.
+- `reports/20260419_1124_calibration_process_braindump.md` — unfiltered narrative of the calibration process across race 1 and race 2, including what was tried, what failed, and why. Intended as source material for the write-up.
 
 ## Dependencies
 
