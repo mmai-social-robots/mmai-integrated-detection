@@ -20,3 +20,6 @@ pyrealsense2>=2.50.0
 pandas>=2.0.0
 pyarrow>=14.0.0
 scipy>=1.10.0
+
+# v2 annotation + student-distillation pipeline
+openai>=1.50.0

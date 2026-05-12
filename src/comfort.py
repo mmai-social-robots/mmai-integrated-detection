@@ -90,6 +90,11 @@ class IntegratedComfortScorer:
     def phase(self) -> Phase:
         return self._phase
 
+    @property
+    def current_posture_weight(self) -> float:
+        """Final fusion posture weight for the active phase."""
+        return float(self._phase_weights[self._phase].get("posture_weight", 0.0))
+
     # -- Core update ---------------------------------------------------------
 
     def _ema_alpha(self, dt_s: float) -> float:

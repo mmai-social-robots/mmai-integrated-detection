@@ -68,7 +68,9 @@ class IntegratedPipeline:
             result.gaze = self.gaze_detector.predict(color_frame)
 
         # --- Posture branch (color + depth) ---
-        result.pose = self.pose_detector.predict(color_frame, depth_frame=depth_frame)
+        # Skip MediaPipe entirely when posture is disabled for the active phase.
+        if self.comfort_scorer.current_posture_weight > 0.0:
+            result.pose = self.pose_detector.predict(color_frame, depth_frame=depth_frame)
 
         # --- Combined scoring ---
         timestamp_s = timestamp_ms / 1000.0
