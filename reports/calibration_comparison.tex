@@ -1,0 +1,284 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage[font=small,labelfont=bf]{caption}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\definecolor{accent}{HTML}{B45309}
+\definecolor{navy}{HTML}{0B2545}
+
+\title{Calibration Impact on Comfort Scoring \\
+  \large Before / After Comparison on the Full 31-Recording Corpus}
+\author{Heejung Roh \and Yiran Tao \and Sparsh Bansal \and Jung Yeop (Steve) Kim}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent
+This note reports the per-scenario impact of the calibration pipeline on the
+deployed comfort score. \textit{Before} = hand-set default configuration
+(\texttt{config/default.yaml}); \textit{After} = the calibrated configuration
+promoted to \texttt{config/deploy.yaml} after race 2 plus the no-pose
+ablation. Numbers are aggregated from a leave-one-recording-out (LORO)
+replay across all 31 RealSense \texttt{.bag} recordings; mean comfort and
+slope are computed over the intent + execution window per recording. Slope
+sign agreement is the fraction of recordings whose comfort slope matches the
+desired sign (\texttt{sc02}: positive; all others: negative).
+
+\begin{table}[h]
+\centering
+\caption{Per-scenario comfort metrics across all 31 LORO replays, before and
+after calibration. Numbers in \textbf{bold} highlight where calibration
+materially improved an entry against the desired behavior.}
+\label{tab:calibration_comparison}
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{l c c r r r r c c}
+\toprule
+\multirow{2}{*}{Scenario} & \multirow{2}{*}{$n$} & \multirow{2}{*}{Label}
+  & \multicolumn{2}{c}{Mean comfort} & \multicolumn{2}{c}{Slope (pts/s)} & \multicolumn{2}{c}{Direction agree} \\
+\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
+ & & & Before & After & Before & After & Before & After \\
+\midrule
+sc01\_walkby            & 7 & abort    & 69.2 & 50.2 & $-0.27$ & $-0.39$ & 5/7 & 5/7 \\
+sc02\_comfortable       & 8 & continue & 68.3 & {\bfseries\color{accent}92.7} & $-2.51$ & {\bfseries\color{accent}$+0.73$} & 0/8 & {\bfseries\color{accent}7/8} \\
+sc03\_gradual\_disc.\   & 5 & abort    & 78.8 & 79.5 & $+0.16$ & {\bfseries\color{accent}$-2.29$} & 1/5 & {\bfseries\color{accent}5/5} \\
+sc04\_sudden\_wdraw     & 5 & abort    & 74.8 & 78.8 & $-0.96$ & $-2.46$ & 5/5 & 5/5 \\
+sc05\_distracted        & 6 & abort    & 73.2 & 73.0 & $-1.25$ & $-3.28$ & 6/6 & 6/6 \\
+\midrule
+\multicolumn{3}{l}{\textbf{Direction-correct total}} & & & & & 17/31 (55\%) & {\bfseries\color{accent}28/31 (90\%)} \\
+\multicolumn{3}{l}{Held-out test best Youden $J$ \;($n{=}8$)} & 0.00 & {\bfseries\color{accent}1.00} & & & & \\
+\multicolumn{3}{l}{sc02$\,-\,$sc01 mean gap} & $-0.9$ & {\bfseries\color{accent}$+42.5$} & & & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Reading the table.}
+Three things change under calibration. First, the \textit{ordering} between
+abort and continue scenarios flips from inverted to a clean +42.5-point
+separation, driven entirely by \texttt{sc02} climbing from 68.3 to 92.7 and
+\texttt{sc01} falling from 69.2 to 50.2. Second, the \textit{direction} of
+the comfort trajectory becomes correct on 28 of 31 recordings (90\%) versus
+17 of 31 (55\%) under default --- the largest gain is on \texttt{sc02},
+where 0 of 8 successful handovers trended the right way under default, and
+7 of 8 do under deploy. Third, \texttt{sc03} (gradual discomfort) flips from
+trending slightly \emph{upward} (slope $+0.16$, wrong direction) to a
+strongly negative slope ($-2.29$), with direction agreement going from 1/5
+to 5/5.
+
+\paragraph{What didn't change.}
+\texttt{sc04} (sudden withdrawal) and \texttt{sc05} (distracted) were
+already at 100\% direction agreement under default; calibration steepens
+their downward slopes (more decisive aborts) but leaves the categorical
+classification unchanged. \texttt{sc01} (walk-by) direction agreement stays
+at 5/7 --- the two outlier recordings remain ambiguous --- but the absolute
+mean comfort drops 19 points, well below any plausible abort threshold, so
+the categorical decision is correct even on the disagreeing recordings.
+
+\paragraph{The headline number.}
+Best Youden's $J$ on the held-out test set ($n{=}8$, including 3 aborts)
+goes from $0.00$ at any threshold $\tau \in [30, 80]$ under default to
+$1.00$ at $\tau \in [55, 68]$ under deploy --- the default configuration
+cannot separate abort from continue \emph{at any threshold}, while deploy
+yields a wide margin window for the controller to operate in.
+
+\clearpage
+\section*{Optimization Search Space}
+
+\noindent
+Calibration tunes a 20-dimensional parameter vector via differential
+evolution against the cached parquets extracted in Stage A. Pretrained
+backbone weights (RetinaFace, EfficientNet-B0, L2CS-Net, MediaPipe Pose)
+are frozen; only the fusion / decision-layer parameters listed in
+Table~\ref{tab:search_space} are searched. The abort threshold $\tau^{*}$
+is selected post-hoc from the held-out ROC curve and is not part of the
+DE search. Source of truth: \texttt{PARAM\_NAMES} and \texttt{BOUNDS} in
+\texttt{scripts/optimize\_params.py}.
+
+\begin{table}[h]
+\centering
+\caption{Variables tweaked during few-shot optimization. Twenty parameters
+spanning fusion weights, sub-score coefficients, gaze/posture event
+thresholds and penalties, temporal smoothing, and missing-detection EMA
+decay. Bounds were chosen to keep DE candidates physically interpretable
+without artificially clipping the search.}
+\label{tab:search_space}
+\small
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{l l l l}
+\toprule
+Group & Parameter & Bounds & Role \\
+\midrule
+\multirow{6}{*}{\parbox{2.5cm}{Phase-aware\\fusion weights}}
+  & \texttt{we\_intent}            & $[0.1,\,0.9]$ & emotion weight, intent phase \\
+  & \texttt{wp\_intent}            & $[0.1,\,0.9]$ & posture weight, intent phase \\
+  & \texttt{wg\_intent}            & $[0.0,\,1.0]$ & gaze weight, intent phase \\
+  & \texttt{we\_exec}              & $[0.1,\,0.9]$ & emotion weight, execution phase \\
+  & \texttt{wp\_exec}              & $[0.1,\,0.9]$ & posture weight, execution phase \\
+  & \texttt{wg\_exec}              & $[0.0,\,1.0]$ & gaze weight, execution phase \\
+\midrule
+\multirow{2}{*}{\parbox{2.5cm}{Emotion sub-score\\coefficients}}
+  & \texttt{gamma}                 & $[0.0,\,1.0]$ & valence coefficient $\gamma$ \\
+  & \texttt{delta}                 & $[0.0,\,1.0]$ & arousal coefficient $\delta$ \\
+\midrule
+\multirow{2}{*}{\parbox{2.5cm}{Gaze cone\\thresholds}}
+  & \texttt{yaw\_threshold}        & $[5^\circ,\,40^\circ]$  & $|\psi| < $ this $\Rightarrow$ engaged \\
+  & \texttt{pitch\_threshold}      & $[5^\circ,\,40^\circ]$  & $|\phi| < $ this $\Rightarrow$ engaged \\
+\midrule
+\multirow{3}{*}{\parbox{2.5cm}{Posture event\\detectors}}
+  & \texttt{face\_cover\_ratio}    & $[0.3,\,0.9]$ & mouth-cover fires if ratio $<$ this \\
+  & \texttt{withdrawal\_threshold\_m} & $[0.05,\,0.30]$ & torso $\Delta z$ for withdrawal (m) \\
+  & \texttt{posture\_drop\_gate}   & $[0.10,\,0.25]$ & withdrawal gated by posture drop \\
+\midrule
+\multirow{2}{*}{\parbox{2.5cm}{Posture event\\penalties}}
+  & \texttt{mouth\_cover\_penalty} & $[0.0,\,50.0]$ & points subtracted on mouth-cover \\
+  & \texttt{withdrawal\_penalty}   & $[0.0,\,50.0]$ & points subtracted on withdrawal \\
+\midrule
+\multirow{1}{*}{\parbox{2.5cm}{Temporal\\smoothing}}
+  & \texttt{ema\_time\_constant\_s} & $[0.1,\,2.0]$ & EMA $\tau$, FPS-independent (s) \\
+\midrule
+\multirow{4}{*}{\parbox{2.5cm}{Missing-detection\\EMA decay}}
+  & \texttt{no\_face\_target}      & $[30,\,80]$   & emotion decay target, face missing \\
+  & \texttt{no\_face\_rate}        & $[0.05,\,0.50]$ & decay rate, face missing (1/s) \\
+  & \texttt{no\_pose\_target}      & $[30,\,80]$   & posture decay target, pose missing \\
+  & \texttt{no\_pose\_rate}        & $[0.05,\,0.50]$ & decay rate, pose missing (1/s) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Why these groupings matter.}
+Three of the seven groups carry most of the empirical weight. The
+\emph{phase-aware fusion weights} (rows 1--6) determine which sub-score
+dominates in each interaction phase; the no-pose ablation discovery is
+literally the observation that \texttt{wp\_intent} and \texttt{wp\_exec}
+calibrate cleanly to zero under our current domain shift. The
+\emph{gaze cone thresholds} widened from the default $25^\circ/20^\circ$ to roughly
+$32^\circ/30^\circ$ in the deployed config --- the change that let \texttt{sc02}'s
+gaze signal stay positive while users reached for the cup. The
+\emph{missing-detection EMA decay} group (rows 17--20) was hardcoded
+before this work; promoting these four constants to tunables was the
+single change that flipped the inverted \texttt{sc01}/\texttt{sc02}
+ordering, by raising \texttt{no\_face\_rate} from $0.15$/s to roughly
+$0.47$/s and dragging \texttt{sc01}'s sparse face-detection frames toward
+the low end of the comfort range.
+
+\paragraph{What is \emph{not} in the search space.}
+The pretrained perception models are frozen --- we do not fine-tune
+RetinaFace, EfficientNet-B0, L2CS-Net, or MediaPipe Pose. The
+\texttt{approach}-phase fusion weights are also fixed at defaults
+($w_e{=}0.5$, $w_p{=}0.5$, $w_g{=}0.3$) because the approach window
+contributes only a small fraction of frames per recording and adding
+three more dimensions for marginal gain was not justified by the
+information density of the dataset. The abort threshold $\tau^{*}$ is
+selected post-hoc from the test-set ROC sweep; including it inside DE
+would conflate calibration with operating-point selection.
+
+\clearpage
+\section*{Optimization Objective}
+
+\noindent
+The calibration searches for a parameter vector
+$\theta \in \mathbb{R}^{20}$ (Table~\ref{tab:search_space}) that minimizes
+the per-fold cross-validated loss
+
+\begin{equation}
+\mathcal{L}(\theta)
+\;=\; -\Bigl[\, \overline{J}(\theta)
+\;+\; \varepsilon \cdot \frac{\mu_{\mathrm{sc02}}(\theta) - \mu_{\mathrm{sc01}}(\theta)}{100}\,\Bigr],
+\label{eq:loss}
+\end{equation}
+
+with $\varepsilon = 0.1$. Equation~\eqref{eq:loss} pairs a primary
+classification term $\overline{J}(\theta)$ with a small linear margin
+tie-breaker. The two terms are derived below.
+
+\paragraph{Per-recording reduction.}
+For each training recording $i$, the runtime pipeline is replayed under
+parameters $\theta$, producing a per-frame integrated comfort series
+$\tilde{C}(t; \theta)$. The recording is summarized by the mean over its
+intent + execution window $W_i$ (defined by the sidecar JSON labels):
+\[
+\bar{C}_i(\theta) \;=\; \frac{1}{|W_i|} \sum_{t \in W_i} \tilde{C}(t; \theta).
+\]
+
+\paragraph{Cross-validated Youden's J.}
+The training set is split into $K{=}5$ label-stratified folds. For each
+held-out fold $f$, the threshold $\tau$ is swept over $[30,\,80]$ and
+Youden's $J$ is taken at its fold-wise maximum:
+\[
+J_f(\theta) \;=\; \max_{\tau \in [30,\,80]}
+\left( \frac{\mathrm{TP}_f(\tau)}{n^{\mathrm{abort}}_f}
+     + \frac{\mathrm{TN}_f(\tau)}{n^{\mathrm{cont}}_f}
+     - 1 \right),
+\]
+where $\mathrm{TP}_f(\tau)$ counts abort-labelled recordings in fold $f$
+with $\bar{C}_i \le \tau$ and $\mathrm{TN}_f(\tau)$ counts continue-labelled
+recordings with $\bar{C}_i > \tau$. The cross-validated term is the mean
+across folds:
+\[
+\overline{J}(\theta) \;=\; \frac{1}{K} \sum_{f=1}^{K} J_f(\theta).
+\]
+
+\paragraph{Scenario margin (tie-breaker).}
+$\mu_{\mathrm{sc02}}(\theta)$ and $\mu_{\mathrm{sc01}}(\theta)$ are the
+means of $\bar{C}_i(\theta)$ over all training recordings labelled with
+each scenario, across all folds. The margin term explicitly rewards
+separation between the representative continue scenario
+(\texttt{sc02}, comfortable handoff) and the representative abort scenario
+(\texttt{sc01}, walk-by), independent of where the optimal threshold lands.
+The weight $\varepsilon = 0.1$ makes this a secondary signal; the primary
+optimization pressure comes from $\overline{J}$.
+
+\paragraph{Optimizer.}
+Equation~\eqref{eq:loss} is minimized using SciPy's
+\texttt{differential\_evolution} with population multiplier $\mathrm{popsize}{=}15$
+(yielding $15 \times 20 = 300$ candidates per generation), $\mathrm{maxiter}{=}50$,
+convergence tolerance $10^{-3}$, fixed seed $42$, deferred whole-generation
+updating, and a final L-BFGS-B polishing pass. Differential evolution is
+gradient-free, which is required because $\overline{J}$ is a rank-based
+classification metric and non-differentiable in $\theta$.
+
+\paragraph{Variable summary.}
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{8pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{l l}
+\toprule
+Symbol & Meaning \\
+\midrule
+$\theta \in \mathbb{R}^{20}$ & parameter vector (Table~\ref{tab:search_space}) \\
+$\tilde{C}(t; \theta)$ & per-frame integrated comfort score, $\in [0,\,100]$ \\
+$W_i$ & intent + execution window of recording $i$ (sidecar-derived) \\
+$\bar{C}_i(\theta)$ & per-recording mean of $\tilde{C}$ over $W_i$ \\
+$\tau$ & abort threshold, swept in $[30,\,80]$ within each fold \\
+$J_f(\theta)$ & Youden's $J$ on fold $f$ at the fold-optimal $\tau$ \\
+$\overline{J}(\theta)$ & mean Youden's $J$ across the $K{=}5$ CV folds \\
+$\mu_{\mathrm{sc02}}, \mu_{\mathrm{sc01}}$ & training-set scenario means of $\bar{C}_i$ \\
+$\varepsilon$ & margin weight $= 0.1$ (tie-breaker) \\
+$K$ & number of stratified CV folds $= 5$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Reading the loss in plain terms.}
+Equation~\eqref{eq:loss} says: \emph{find parameters so that some threshold
+cleanly separates aborts from continues on the per-recording mean comfort
+(Youden's $J$), and as a tie-breaker, make the comfortable-handover
+scenario score higher than the walk-by scenario.} Trajectory shape (whether
+the score trends up or down within a recording) is not in this loss --- it
+was an evaluation gate against which the final calibrated parameters were
+inspected after the search. The shape-aware objective variants F, G, H, and
+I that replaced $\overline{J}$ with tanh-encoded slope terms all reduced
+classification accuracy and lost the variant race; Variant A
+(Eq.~\ref{eq:loss}) remained the winner.
+
+\end{document}
