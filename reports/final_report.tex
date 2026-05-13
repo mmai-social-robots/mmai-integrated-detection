@@ -1,0 +1,567 @@
+% =====================================================================
+% Multimodal Comfort-Aware Human-Robot Handover -- NeurIPS final report
+% =====================================================================
+% Compile with: pdflatex final_report.tex (twice for refs/hyperref)
+%
+% This template targets the NeurIPS 2024 style file (neurips_2024.sty).
+% On Overleaf:
+%   * "New Project" -> "Templates" -> "NeurIPS 2024" gives you the .sty
+%     pre-installed, OR upload neurips_2024.sty from
+%     https://neurips.cc/Conferences/2024/PaperInformation/StyleFiles
+%   * Drop this file in as main.tex (rename if you like).
+%
+% Page budget (per the course Final Instructions PDF):
+%   - 9 pages max for the main paper (sections 1-8)
+%   - References unlimited (extra pages)
+%   - Appendix optional, supplementary (extra pages, not graded)
+
+\documentclass{article}
+
+% Use [final] for a non-anonymous submission (this is a course final report,
+% not a blind submission). Use [preprint] if you want a preprint banner.
+\usepackage[final]{neurips_2024}
+
+% Core packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{nicefrac}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue,
+  citecolor=black,
+}
+
+% inline-code shortcut
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+% listings style for code/JSON blocks (used in appendix mostly)
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+  keepspaces=true,
+}
+
+\title{Multimodal Comfort-Aware Human--Robot Handover: Phase-Aware Late Fusion with Few-Shot On-Site Calibration}
+
+\author{%
+  Heejung Roh \quad Yiran Tao \quad Sparsh Bansal \quad Jung Yeop (Steve) Kim \\
+  Massachusetts Institute of Technology \\
+  \texttt{\{heejungr, yirantao, sparshb, jungyeop\}@mit.edu}
+}
+
+\begin{document}
+\maketitle
+
+%% ===================================================================
+\begin{abstract}
+Social and service robots performing object handovers must adapt to how comfortable each user feels in real time, but the same robot behavior can feel natural to one person and intrusive to another. We present a real-time multimodal comfort-scoring pipeline that fuses pretrained unimodal vision models --- facial emotion (EfficientNet-B0/AffectNet), gaze (L2CS-Net/Gaze360), and body posture (MediaPipe Pose with depth-based withdrawal detection) --- into a single 0--100 comfort score from RealSense RGB-D video. Rather than retraining the perception models, we treat fusion as the learning surface: phase-dependent weights $(w_e, w_p, w_g)$ over the channels are calibrated by differential evolution against a 31-recording custom dataset, with the interaction segmented into \emph{approach}, \emph{intent signaling}, and \emph{service execution} phases via JSON sidecar keypoints. The calibrated configuration achieves perfect abort-decision separation (Youden's $J = 1.0$ at $\tau^\star \approx 78$) on a held-out test set ($n=8$) and 28/31 (90\%) per-recording slope-sign agreement on a LORO sweep, up from 17/31 (55\%) under hand-tuned defaults. The headline negative finding is that under our domain conditions, posture is net-harmful: a no-pose ablation lifts sc02 (successful handover) LORO agreement from 4/8 to 7/8 because MediaPipe false fires dragged successful handovers below the abort threshold. Finally, we use the calibrated fusion pipeline ($\sim$70\,M params, GPU-tethered) as a \emph{teacher} to supervise a 1.58\,M-parameter MobileNetV3-Small \emph{student} regressing the same 0--100 score from a single RGB frame (a $44\times$ compression for on-robot deployment), and cross-check the student against an independent GPT-5.5 vision--language judge prompted with raw frames only (no scenario or phase metadata). On a 10-bag held-out test the student tracks the teacher at MAE 4.1 / $r=0.80$, and the no-leakage VLM judge correlates with the heuristic teacher at $r=0.74$ on per-frame trajectory --- up from $r=-0.10$ under a prior leaky prompt, an artifact-removal result that flipped a previously negative finding into a positive one.
+\end{abstract}
+
+%% ===================================================================
+\section{Introduction}
+%% ===================================================================
+
+Service robots increasingly enter shared social spaces --- hotel lobbies, hospital wards, homes --- where they must hand objects to people with widely varying tolerances for robot proximity, motion, and gaze. The same approach trajectory that feels natural to a roboticist may feel intrusive to a first-time user. If a robot cannot perceive and adapt to individual comfort in real time, it risks startle reactions, avoidance behavior, or safety incidents, and these failure modes scale poorly with deployment.
+
+Despite progress in multimodal perception and comfort measurement, prior work has not closed the perception-to-action loop for socially adaptive \emph{service}. Existing systems either switch between discrete behavior modes rule-based on proximity, or study emotion recognition in isolation from robot control. Three gaps remain. (1) \textbf{Late-fusion at interactive frame rates}: no system fuses face, gaze, and posture into a single continuous comfort score in real time on commodity RGB-D hardware. (2) \textbf{Modality complementarity under domain shift}: each channel has known weaknesses --- facial ambiguity under neutral expressions, gaze unavailability when the face turns away, missed withdrawal in 2D pose --- yet no prior work combines all three with depth-based withdrawal for handovers. (3) \textbf{Phase-conditioned fusion}: gaze is most informative \emph{before} the user reaches, but during the reach the same gaze aversion is a benign attention shift toward the object, not discomfort. A static fusion weight cannot resolve this.
+
+We present a real-time comfort-aware perception pipeline that treats \emph{fusion} --- not the unimodal models --- as the surface on which we learn. We segment each handover into three phases (approach, intent signaling, service execution) and learn phase-specific fusion weights from a small RealSense D435 dataset by differential evolution against a Youden-$J$ abort-decision objective. The calibrated config drives a binary continue/abort policy at a fixed threshold $\tau^\star$. We then address a fourth gap --- \textbf{edge deployability} --- by treating the calibrated pipeline ($\sim$70\,M params across four backbones, GPU-tethered) as a \emph{teacher} that labels every frame of every recording, then training a 1.58\,M-param MobileNetV3-Small \emph{student} via Huber regression to reproduce the score from a single RGB frame.
+
+Contributions: (i) a phase-aware late-fusion comfort scorer with EMA smoothing and missing-detection decay, deployable with zero retraining of perception models; (ii) a four-stage calibration pipeline (split $\to$ cached feature extraction $\to$ DE optimize $\to$ held-out evaluate) where optimization runs in seconds per configuration on cached features; (iii) experimental evidence that pose, despite a clear standalone signal, is net-harmful under our domain shift --- an \emph{ablation that beat its parent variant} --- with a mechanism-level explanation; (iv) a teacher--student distillation demonstrating that the calibrated comfort signal supervises a $44\times$-smaller single-RGB-frame student, validated against an independent VLM-as-judge.
+
+%% ===================================================================
+\section{Related Work}
+%% ===================================================================
+
+\paragraph{Multimodal perception.} Churamani et al.~\cite{ref16} fuse facial expression and speech via late fusion into an Affective Core (Grow-When-Required network) driving DDPG policy learning --- the closest existing pipeline to ours, though they target dialogue and omit gaze. Surveys by Wang et al.~\cite{ref02}, Su et al.~\cite{ref03}, and Zhao et al.~\cite{ref04} systematically review 60--227 papers and identify cognition-level comfort fusion, cross-modal temporal alignment, and the perception-to-action loop as the most prominent gaps. Fusion approaches range from confidence-weighted attention~\cite{ref18} and bilevel NAS~\cite{ref19} for action recognition, through musculoskeletal IK fusion of RGB-D and IMU under occlusion~\cite{ref20}, to vision--language models such as PaLM-E~\cite{ref21} that unify images, robot state, and text into a shared latent space. Our work sits in the simplest of these regimes --- score-level late fusion --- but treats the phase-conditioned fusion weights themselves as the trainable surface.
+
+\paragraph{Comfort measurement and continuous comfort scoring.} Yan and Jia~\cite{ref05} propose a comfort taxonomy spanning ergonomic, motion, anthropomorphism, and sociability dimensions, measured both subjectively (Likert) and objectively (HRV, EDA, EEG). Yan et al.~\cite{ref06} regress physical factors (distance, speed, angle) onto predicted comfort but omit emotional signals; Lorenzini et al.~\cite{ref07} review ergonomic HRI in industry. Gonzalez-Santocildes et al.~\cite{ref08} use RL to adapt robot behavior from a continuous comfort signal, demonstrating that an online comfort score \emph{can} drive policy. Heinisch et al.~\cite{ref09} release AFFECT-HRI, the only public HRI dataset pairing physiological signals (Empatica E4 GSR/BVP) with affect labels.
+
+\paragraph{Affect-aware interaction and decision-making.} Spezialetti et al.~\cite{ref10} note that robot presence itself biases human emotional response, motivating in-situ rather than benchmark evaluation. Freire et al.~\cite{ref11} propose DAC-HRC, a layered adaptive control architecture with explicit personalization; Abdollahi et al.~\cite{ref12} show that an empathic robot (``Ryan'') improves engagement. Namba et al.~\cite{ref13} adopt the graduated normal/slow/stop structure we follow, but the controller is purely rule-based. For decision-making under uncertainty, Zheng et al.~\cite{ref14} learn POMDPs for collaboration, Pandya~\cite{ref15} grounds influence-aware safety in Bayesian MDPs, and Brunke et al.~\cite{ref17} survey safe learning in robotics. Datasets for perception backbones we adopt include Gaze360~\cite{ref25} and AffectNet~\cite{ref26}; SALSA~\cite{ref22}, the Vernissage corpus~\cite{ref23}, and JRDB~\cite{ref24} provide related social-interaction benchmarks.
+
+\paragraph{How our work differs.} To our knowledge, no prior system fuses facial emotion, gaze, and body posture from RGB-D video into a continuous, \emph{phase-aware} real-time comfort score for the handover scenario, then few-shot calibrates that fusion at the deployment site, then distills the result into an edge-deployable single-modality student. Our pipeline closes this gap with score-level late fusion behind a binary abort policy, calibrated against a small ($n=31$) site-specific recording corpus.
+
+%% ===================================================================
+\section{Problem Statement}
+%% ===================================================================
+
+Let $x_t = (I_c^{(t)}, I_d^{(t)})$ be an RGB-D frame pair captured at time $t$ during a handover, with $I_c^{(t)}$ the color frame and $I_d^{(t)}$ the aligned depth map from an Intel RealSense D435. Each recording is annotated with up to four temporal keypoints $(t_\text{start}, t_\text{signal}, t_\text{handover|abort}, t_\text{end})$ defining a phase indicator $\varphi(t) \in \{\text{approach, intent, execution}\}$:
+\[
+\code{[t\_start]} \xrightarrow{\text{approach}} \code{[t\_signal]} \xrightarrow{\text{intent}} \code{[t\_handover|abort]} \xrightarrow{\text{execution}} \code{[t\_end]}
+\]
+
+The pipeline emits two per-frame channel scores: emotion $C_e^{(t)} = f_e(I_c^{(t)}; \theta_E, \theta_G)$ (facial valence/arousal from EfficientNet-B0 fused with a binary ``looking-at-camera'' signal from L2CS-Net) and posture $C_p^{(t)} = f_p(I_c^{(t)}, I_d^{(t)})$ (MediaPipe Pose openness, depth-based withdrawal, mouth-covering). Each is independently EMA-smoothed in continuous time with $\alpha(\Delta t) = 1 - \exp(-\Delta t / \tau_\text{ema})$, so smoothing is FPS-independent. The integrated comfort score is the phase-conditioned weighted blend
+\begin{equation}
+\tilde{C}_t = w_e^{\varphi(t)}\,\tilde{C}_e^{(t)} + w_p^{\varphi(t)}\,\tilde{C}_p^{(t)},\quad w_e^\varphi + w_p^\varphi = 1\;\forall \varphi. \label{eq:fusion}
+\end{equation}
+When detection fails on a channel, the channel decays exponentially toward a tunable target (\code{no\_face\_target}, \code{no\_pose\_target}) at a tunable rate. The robot controller collapses the policy to a binary gate at $\tau^\star$:
+\begin{equation}
+\pi(\tilde{C}_t) = \begin{cases} \text{continue} & \tilde{C}_t > \tau^\star \\ \text{abort} & \text{otherwise}.\end{cases} \label{eq:policy}
+\end{equation}
+
+The learning problem is: given a small set of labeled recordings with ground-truth class $y \in \{\text{continue, abort, ambiguous}\}$, fit the 20-dimensional parameter vector $\theta$ controlling fusion weights, gaze cone, EMA $\tau$, decay rates, and penalties so as to maximize Youden's $J$ on the abort decision while keeping each scenario's comfort \emph{trajectory} trending in the correct direction.
+
+%% ===================================================================
+\section{Proposed Method}
+%% ===================================================================
+
+\subsection{System architecture}
+
+Figure~\ref{fig:arch} shows the runtime pipeline. The color frame is forked into a GPU emotion branch and a CPU posture branch, which run independently and report per-frame outputs to a shared \code{IntegratedComfortScorer}. The branches are deliberately decoupled so the system \textbf{degrades gracefully}: if the face is occluded the posture channel still reports, and vice-versa. Frames in which a channel is missing trigger a per-channel exponential decay toward a tunable target rather than a hard zero, so a brief detection dropout neither flips the decision nor injects step changes into the EMA.
+
+\begin{figure}[t]
+\centering
+\begin{lstlisting}
+RealSense .bag (color + aligned depth)
+        |
+        +--> GPU branch
+        |     +- RetinaFace --------> face bbox
+        |     +- EfficientNet-B0 ---> (emotion, valence, arousal)
+        |     +- L2CS-Net (Gaze360)-> (yaw, pitch) -> "looking-at-camera"
+        |
+        +--> CPU branch
+        |     +- MediaPipe Pose ----> 33 landmarks
+        |          +- open-posture ratio
+        |          +- mouth-covering check
+        |          +- depth-based withdrawal detector (uses I_d)
+        |
+        +--> IntegratedComfortScorer
+                  +- phi(t) set by JSON keypoints (calibration)
+                  |   or controller (deployment)
+                  +- continuous C(t) in [0,100]
+                      -> binary continue/abort at tau*
+\end{lstlisting}
+\caption{Phase-aware late-fusion architecture. Each branch operates independently; the comfort scorer combines them with phase-conditioned weights. Phase is supplied externally --- by the calibration harness during fitting and by the robot controller's state machine during deployment. \emph{(Placeholder ASCII diagram; replace with a rendered figure for the camera-ready version.)}}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Per-frame instant scores}
+\label{sec:instant}
+
+\textbf{Emotion instant.} Given a detected face, EfficientNet-B0 produces a categorical emotion plus continuous valence $v \in [-1, 1]$ and arousal $a \in [-1, 1]$; L2CS-Net produces gaze $(\text{yaw}, \text{pitch})$ from which we derive a binary ``looking-at-camera'' signal $g \in \{0, 1\}$ using yaw/pitch thresholds. The instant emotion score normalized into $[0, 100]$ is
+\begin{equation}
+C_e = \frac{(\gamma v - \delta a + w_g^{\varphi(t)} g) + (|\gamma| + |\delta| + w_g)}{2(|\gamma| + |\delta| + w_g)} \cdot 100.
+\end{equation}
+The phase-specific gaze coefficient $w_g^{\varphi}$ is what makes ``looking at the camera'' load heavily during \emph{intent signaling} and barely at all during \emph{execution}, where a downward gaze toward the cup is a benign attention shift.
+
+\textbf{Posture instant.} From MediaPipe's 33 landmarks we compute a body-openness ratio clipped to $[0, 1]$ and check two depth-aware events: (i) mouth-covering when hand-to-mouth distance falls below \code{face\_cover\_ratio}~$\times$~shoulder-width, and (ii) sudden-withdrawal when a smoothed torso depth jumps by more than \code{withdrawal\_threshold\_meters} over the recent history. Each fired event subtracts a fixed penalty (\code{mouth\_cover\_penalty}, \code{withdrawal\_penalty}).
+
+\subsection{Phase-aware fusion and missing-detection decay}
+
+When a channel is missing on a given frame, $\tilde{C}_k^{(t)} \leftarrow \tilde{C}_k^{(t-1)} + (\text{target}_k - \tilde{C}_k^{(t-1)}) (1 - e^{-\Delta t \cdot \text{rate}_k})$. This is the mechanism by which a walk-by recording --- where face detection is sparse because the user never turns toward the camera --- accumulates downward drift into the abort region without requiring positive evidence of discomfort. The four parameters $(\text{target}_e, \text{rate}_e, \text{target}_p, \text{rate}_p)$ are tunable by calibration; in the deployed config the no-face decay rate is $\sim$3$\times$ the hand-set default --- this turns out to be the single largest contributor to separating walk-by from successful handover (\S\ref{sec:mechanism}).
+
+\subsection{Calibration via differential evolution on cached features}
+
+The perception backbones are pretrained black boxes; the learning surface is a 20-dimensional fusion vector $\theta$. Five of those 20 entries --- the four (target, rate) pairs for missing-face/missing-pose decay, plus \code{posture\_drop\_gate} --- were previously hardcoded constants in the runtime; an interim diagnostic surfaced that the slow hardcoded \code{no\_face\_rate}~$=0.15/\text{s}$ was a drag ceiling silently capping what calibration could achieve (\S\ref{sec:mechanism}). Promoting these to tunables grew the search from 15 to 20 dimensions and turned out to be load-bearing. The remaining 15 entries cover fusion weights (intent/exec $\times$ emotion/pose/gaze), gaze cone (yaw/pitch), \code{face\_cover\_ratio}, the two penalty magnitudes, \code{withdrawal\_thresh\_m}, $\gamma$, $\delta$, and $\tau_\text{ema}$ (full bounds in Appendix~\ref{app:bounds}).
+
+An engineering refactor underwrites the speed of the search: \code{score\_recording(rec, p) $\to$ float} became \code{replay\_series(rec, p) $\to$ (timestamps, integrated)}, so every candidate objective is a pure reducer over the same per-frame series. Swapping objectives costs nothing; LORO becomes a one-liner on the same cache.
+
+The pipeline (\code{scripts/calibrate.py}) has four stages: (1) \textbf{split} --- 75/25 stratified by scenario, seed 42; (2) \textbf{extract} --- runs the four perception models once per recording, caching per-frame features as parquets; subsequent iterations replay from cache in pure NumPy; (3) \textbf{optimize} --- \code{scipy.optimize.differential\_evolution} on the cross-validated loss below; (4) \textbf{evaluate} --- single pass on held-out test, producing $\tau$-sweep, slope-sign agreement, and bootstrap CIs.
+
+\textbf{Loss function.} For each training recording $i$, the runtime pipeline is replayed under parameters $\theta$, producing per-frame integrated comfort $\tilde{C}(t;\theta)$, summarized by the mean over the recording's intent$\cup$execution window $W_i$ (sidecar-defined):
+\begin{equation}
+\bar{C}_i(\theta) = \tfrac{1}{|W_i|}\sum_{t \in W_i} \tilde{C}(t;\theta).
+\end{equation}
+The training set is split into $K=5$ label-stratified folds. For each held-out fold $f$, Youden's $J_f(\theta) = \max_{\tau \in [30, 80]} \bigl(\text{TPR}_f(\tau) + \text{TNR}_f(\tau) - 1\bigr)$ is computed on $\bar{C}_i$; the cross-validated term is $\bar{J}(\theta) = \tfrac{1}{K}\sum_f J_f(\theta)$. The winning variant A minimizes
+\begin{equation}
+\mathcal{L}_A(\theta) = -\Bigl[\,\bar{J}(\theta) + \varepsilon \cdot \tfrac{\mu_\text{sc02}(\theta) - \mu_\text{sc01}(\theta)}{100}\,\Bigr],\quad \varepsilon = 0.1, \label{eq:loss}
+\end{equation}
+pairing the primary classification term $\bar{J}$ with a small sc02-vs-sc01 mean-margin tie-breaker over training-set scenario means $\mu_\text{sc02}, \mu_\text{sc01}$. Differential evolution settings: $\text{popsize}=15$ (= 300 candidates per generation), $\text{maxiter}=50$, $\text{tol}=10^{-3}$, deferred whole-generation updating, final L-BFGS-B polish, seed 42. DE is gradient-free, which is required because $\bar{J}$ is rank-based and non-differentiable in $\theta$. The full equation, derivation, and parameter-bound table are in \code{reports/calibration\_comparison.tex}~\cite{ref30}.
+
+\textbf{Trajectory shape is an evaluation gate, not part of the loss.} Whether $\tilde{C}_t$ trends up or down within a recording does not enter Eq.~\eqref{eq:loss}; per-scenario slope-sign agreement is computed \emph{after} the search as one of seven pre-registered acceptance gates (\S\ref{sec:race}). The shape-aware objective variants we tried (F/G/H/I, \S\ref{sec:race}) \emph{replaced} $\bar{J}$ with tanh-encoded slope terms, $\text{shape} = \tanh(3\hat\beta W / 100) \in [-1, +1]$ for slope $\hat\beta$ over window width $W$; all four lost to variant~A.
+
+\textbf{Two-race protocol.} Calibration ran in two rounds. \textbf{Race 1} (15-dim, four variants, cheap budget) put A against a mean-of-last-30\% shape-aware variant: A landed $J=1.0$ with a barely-positive sc02 slope, while the shape-aware variant got a clearly-positive sc02 slope but $J=0.667$ (below the $J\ge 0.80$ gate). Neither cleared every gate; the failure pattern surfaced the drag-ceiling issue diagnosed above. \textbf{Race 2} added the five new tunables, the six objective variants (A, C, F, G, H, I), and full DE budget run in parallel across a 23-core machine.
+
+\subsection{Inference}
+
+At deployment, the robot controller drives \code{set\_phase(...)} from its own state machine (\code{approach} while motion-planning, \code{intent} while signaling, \code{execution} once the arm crosses the OTP plane). A 0.3\,s warmup after each phase transition freezes the integrated output to suppress the EMA transient. The continuous $\tilde{C}_t$ is gated against $\tau^\star = 80$.
+
+%% ===================================================================
+\section{Experimental Methodology}
+%% ===================================================================
+
+\textbf{Dataset.} We collected 31 RGB-D recordings (\code{.bag}, 30\,FPS) on an Intel RealSense D435 mounted on a Bambot manipulator, spanning five scenarios (Table~\ref{tab:scen}). Each \code{.bag} carries a JSON sidecar (Appendix~\ref{app:sidecar}) with keypoints \code{start / signal / handover (or abort) / end} annotated post-hoc. Each scenario was filmed under both bright and dim lighting. The split is 23 train / 8 test, stratified by class (continue / abort / ambiguous); held-out test contains 2 sc01, 2 sc02, 1 sc03, 1 sc04, 2 sc05.
+
+\begin{table}[h]
+\centering
+\caption{Scenarios.}
+\label{tab:scen}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+code & scenario & label & $n$ \\
+\midrule
+sc01 & walk-by, no interest & abort & 7 \\
+sc02 & comfortable handover & continue & 8 \\
+sc03 & gradual discomfort during handover & ambiguous & 5 \\
+sc04 & sudden withdrawal mid-handover & abort & 5 \\
+sc05 & distracted (looking at phone) & ambiguous & 6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Pretrained models (all used out-of-the-box).} RetinaFace; EfficientNet-B0 / \code{enet\_b0\_8\_va\_mtl} (AffectNet-pretrained~\cite{ref26}); L2CS-Net / \code{L2CSNet\_gaze360} (Gaze360-pretrained~\cite{ref25}); MediaPipe Pose, complexity 1. Only the 20 fusion-layer hyperparameters are learned.
+
+\textbf{Metrics.} Youden's $J$ at $\tau^\star$ on the held-out test plus a $\tau$-sweep over $[30, 80]$; per-scenario mean comfort with bootstrap 95\% CIs (1000 resamples); per-recording slope sign agreement over the intent$\cup$execution windows (correct = positive for sc02, negative otherwise); and a LORO sweep over all 31 recordings.
+
+\textbf{Baselines and ablations.} \code{config/default.yaml} (hand-tuned midterm config, never optimized); \code{config/deploy.yaml} (calibrated A-no-pose winner, see \S\ref{sec:nopose}); six DE objective variants A, C, F, G, H, I; a no-pose ablation pinning $w_p = 0$.
+
+%% ===================================================================
+\section{Results and Discussion}\label{sec:results}
+%% ===================================================================
+
+\subsection{Calibrated config separates abort from continue cleanly}
+
+Table~\ref{tab:headline} compares the hand-tuned default with the calibrated deploy on the held-out test ($n=8$) and full-corpus LORO ($n=31$).
+
+\begin{table}[h]
+\centering
+\caption{Default vs deploy on held-out test and LORO.}
+\label{tab:headline}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+metric & default & deploy & $\Delta$ \\
+\midrule
+best Youden $J$ on test & 0.00 @ $\tau$=30 & \textbf{1.00 @ $\tau$=78} & +1.00 \\
+decisions at $\tau^\star$ (test) & --- & TP\,3 / FN\,0 / FP\,0 / TN\,2 & perfect \\
+sc01 mean (test, abort) & 69.0 & \textbf{50.3} & $-$18.7 \\
+sc02 mean (test, continue) & 66.6 & \textbf{92.8} & +26.2 \\
+LORO slope-sign agreement ($n=31$) & 17/31 (55\%) & \textbf{28/31 (90\%)} & +11 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The default cannot separate abort from continue at \emph{any} $\tau \in [30, 80]$: $J = 0.0$ because sc01 outscores sc02 in absolute level. The calibrated deploy flips this ordering and opens a 42-point margin between sc01 and sc02 means; the same margin holds across LORO (sc01 = 50.2, sc02 = 92.7 across all 15 recordings). Per-recording, under the default, sc02 \emph{trends downward} during successful handovers (mean slope $-3.05$); under deploy, every test recording's slope has the correct sign (8/8). LORO slope-sign agreement on sc02 jumps from 0/8 to 7/8 and on sc03 from 1/5 to 5/5.
+
+\subsection{Race-2 objective variants: shape vs.\ level is genuinely a trade}\label{sec:race}
+
+Variant A's objective (Eq.~\ref{eq:loss}) optimizes \emph{level} via $\bar J$ plus a small mean-margin tie-breaker. Variants C/F/G/H/I \emph{replace} $\bar J$ (or the margin term) with shape-aware reducers built on the tanh slope term defined in \S4.4; we use them to test whether trajectory direction can be optimized inside the loss without sacrificing classification. Per-scenario slope sign remains an \emph{evaluation gate} for all variants: $+$ for sc02, $-$ for sc01/sc04. We raced six variants on the same 5-fold CV folds (Table~\ref{tab:race}), against seven pre-registered acceptance gates: $J \ge 0.80$, sc02 mean $\ge 80$, sc01 mean $\le 65$, sc04 mean $\le 65$, and per-scenario slope-sign agreement on sc02 ($+$), sc01 ($-$), sc04 ($-$).
+
+\begin{table}[h]
+\centering
+\caption{Race-2 variants on held-out test. The ``objective'' column lists what each variant optimizes \emph{inside} the loss; slope-sign agreement is a post-hoc gate, never minimized. Slopes in pts/s.}
+\label{tab:race}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}clrrrrrrc@{}}
+\toprule
+var & objective & sc02 $\hat\beta$ & sc01 $\hat\beta$ & sc04 $\hat\beta$ & sc02 $\mu$ & sc01 $\mu$ & $J$ & gates \\
+\midrule
+\textbf{A} & $\bar J + \varepsilon\cdot\text{margin}$ (Eq.~\ref{eq:loss}) & $+0.10$ & $-0.54$ & $-2.82$ & 89.1 & 55.8 & 1.0 & \textbf{6/7} \\
+C          & late$-$early delta of $\bar C_i$ replaces $\bar J$           & $+2.14$ & $-1.26$ & $+0.47$ & 65.8 & 49.5 & 1.0 & 5/7 \\
+F          & $\bar J$ + sc02-only tanh slope                              & $+2.86$ & $+2.88$ & $+1.48$ & 73.6 & 53.5 & 1.0 & 4/7 \\
+G          & $\bar J$ + mean tanh slope across scenarios                  & $-0.75$ & $-2.38$ & $-3.50$ & 81.5 & 75.5 & 1.0 & 4/7 \\
+H          & G's objective on the 20-dim space                            & $-0.72$ & $-3.35$ & $-3.34$ & 80.7 & 75.2 & 1.0 & 4/7 \\
+I          & sc02-weighted ($\times 3$) tanh slope + sign penalty         & $+0.89$ & $+2.61$ & $-1.48$ & 77.1 & 65.7 & 1.0 & 4/7 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Each variant fails a specific way. \textbf{C} (delta reducer in place of $\bar J$) collapses levels: DE satisfies ``sc02 delta positive'' by lifting sc02 while parking other scenarios flat near $\tau$. \textbf{F} ($\bar J$ + sc02-only tanh slope) lifts \emph{every} scenario uniformly --- classic Goodhart, with nothing in the loss telling DE to push sc01/sc04 down. \textbf{G} ($\bar J$ + all-scenario \emph{mean} tanh slope) is the cautionary tale: mean-aggregation lets DE sacrifice the sc02 minority by making sc01/sc03/sc04/sc05 fall very steeply (slopes $-2.4$ to $-3.5$) while letting sc02 drift to $-0.75$. \textbf{H} runs G's objective on the new 20-dim space --- the same failure persists, confirming the problem is objective \emph{geometry}, not parameter-space dimensionality. \textbf{I} weights sc02's tanh slope $3\times$ and adds a hard penalty on negative sc02 slope; sc02 is fixed ($+0.89$) but sc01 drifts up ($+2.61$) because DE finds it cheapest to relax the unguarded scenario. \textbf{A} --- the level-only baseline plus margin --- is the most boring objective but the strongest gate-count winner; its barely-positive sc02 slope ($+0.10$) is the cost, and slope sign is recovered post-hoc by the no-pose ablation (\S\ref{sec:nopose}). The project's negative result: a single-objective DE with 23 training recordings cannot reliably satisfy both \emph{level} and \emph{shape} gates from inside the loss without overcorrection. We promoted A and exposed the trade-off rather than hide it.
+
+\subsection{The surprise no-pose ablation}\label{sec:nopose}
+
+Per the original plan we ran a confirmatory ablation --- objective A with $w_p^\text{intent} = w_p^\text{exec} = 0$ pinned via \code{--pin-wp~0.0}, same DE budget. \textbf{The ablation won decisively} (Table~\ref{tab:nopose}).
+
+\begin{table}[h]
+\centering
+\caption{A vs.\ A-no-pose on held-out test and LORO.}
+\label{tab:nopose}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+metric & A (with pose) & A-no-pose & $\Delta$ \\
+\midrule
+sc02 slope (test)              & $+0.10$ & \textbf{$+1.05$} & +0.95 \\
+sc02 mean (test)               & 89.1 & 92.8 & +3.7 \\
+sc01 mean (test)               & 55.8 & \textbf{50.3} & better sep.\ \\
+slope-sign agreement (test)    & 3/5  & \textbf{5/5}  & +2 \\
+sc02 LORO agreement            & 4/8  & \textbf{7/8}  & +3 \\
+sc01 LORO agreement            & 6/7  & 5/7  & $-$1 \\
+$J$ on test                    & 1.0  & 1.0  & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Pose was \emph{actively harming} the trajectory signal. DE converged to nonzero $w_p$ in A because it marginally helped $J$ on CV folds, but on held-out test the pose domain shift surfaced. Specifically: in cached sc02 parquets the MediaPipe withdrawal condition fired in 2--4\% of intent$+$execution frames and mouth-cover up to 1.3\% --- low but non-zero where zero was expected. Each spurious fire subtracted 25 (withdrawal) or 30 (mouth-cover) from the posture sub-score, which under the 65\% execution pose weight propagated directly into sc02's integrated comfort. CV couldn't see this because all folds share the same systematic bias. We promoted A-no-pose to \code{config/deploy.yaml} but document that $w_p = 0$ is \textbf{dataset-conditional}; the posture module remains in the runtime as a diagnostic, and \code{--pin-wp} can be removed when a future dataset has smaller pose domain shift.
+
+\subsection{Mechanism: what specifically flipped sc01/sc02}\label{sec:mechanism}
+
+The calibrated deploy attacks three mechanisms simultaneously. (1) \textbf{Posture weight pinned to 0} (intent $0.4 \to 0.0$, exec $0.65 \to 0.0$); see \S\ref{sec:nopose}. (2) \textbf{Missing-detection decay rate accelerated $\sim$3$\times$} (\code{no\_face\_rate} $0.15/\text{s} \to 0.469/\text{s}$). The default's $\sim$6.7\,s half-life left sc01 (with $\sim$40\% face-detection rate) drifting only slowly toward the no-face target; deploy drags it firmly toward the low-30s, while sc02's 68--72\% face-detection rate means the boosted rate barely affects it. \textbf{This is the single largest contributor to the 42-point separation} and the artifact that justified promoting the four hardcoded decay constants to tunables. (3) \textbf{Phase-conditioned gaze and emotion become load-bearing}: intent emotion $0.6 \to 0.882$; intent gaze $0.6 \to 0.808$; yaw cone $25^\circ \to 31.7^\circ$; pitch cone $20^\circ \to 29.9^\circ$. With pose removed, the remaining channels carry the signal; the widened gaze cone matters because sc02 users don't always fixate perfectly on the camera while reaching. Smaller supporting changes (\code{face\_cover\_ratio} $0.6 \to 0.85$, \code{withdrawal\_penalty} $25 \to 11.9$, $\gamma$/$\delta$ floors $\to 0$, $\tau_\text{ema}$ $0.5 \to 0.286$) are tabulated in \code{reports/default\_vs\_deploy.md}.
+
+\subsection{Caveats, real-time performance, and live deployment}
+
+\textbf{What we wouldn't claim.} $J = 1.0$ on $n=8$ is consistent with binomial CIs from 0.37 to 1.0; LORO sc02 7/8 is honestly reported (one fully-comfortable recording stays flat-high rather than rising); no-pose is dataset-conditional, not a universal claim about pose.
+
+\textbf{Real-time performance.} End-to-end the integrated pipeline processes RealSense \code{.bag} playback at 13.6--58.2\,FPS on the deployment workstation (RTX-class GPU + 23-core CPU), bottlenecked by L2CS-Net gaze inference; the CPU posture branch runs concurrently with the GPU emotion branch.
+
+\textbf{Live deployment.} We drove the robot through \code{live\_comfort.py} under both configs. Under default, the integrated score never reaches $\tau^\star$ --- the controller never triggers \code{continue}. Under deploy, the same operator/scenario set is partitioned correctly at runtime: walk-by stays low, sudden-withdrawal collapses, comfortable handover crosses $\tau^\star$ in a stable plateau. Qualitative live behavior is consistent with offline split and LORO.
+
+%% ===================================================================
+\section{Edge Deployment: Two Teachers, One Student}\label{sec:distill}
+%% ===================================================================
+
+The calibrated pipeline works, but it is not where we want to ship: $\sim$70\,M parameters across four pretrained vision models, sustaining 30\,FPS requires an RTX-class GPU laptop tethered to the Bambot. We therefore distil the calibrated signal into an edge-deployable single-RGB-frame student, and --- because student$\leftrightarrow$teacher agreement could merely reflect the student imitating teacher artifacts --- we additionally validate against an independent vision--language-model (VLM) judge that never sees scenario or phase metadata. The full pipeline is in \code{V3\_PIPELINE.md}; empirical numbers are in \code{V3\_TEST\_REPORT.md}; 10 side-by-side comparison videos and the verbatim VLM system prompt are mirrored on the HuggingFace dataset \code{yirantao1000/mmai-comfort-handover-v3}~\cite{ref29}.
+
+\subsection{Two teachers}
+
+\textbf{Heuristic teacher.} \code{config/deploy.yaml} run over every recording, emitting one dense $\sim$30\,Hz per-frame $\tilde{C}_t \in [0, 100]$ per RGB frame. Labels embed the full multimodal context (phase-aware fusion, EMA, missing-detection decay) even though only the RGB frame is exposed to the student.
+
+\textbf{VLM teacher (independent judge).} GPT-5.5 via the Responses API, prompted with raw frames plus timestamps and \emph{nothing else} --- no scenario name, no expected outcome, no phase, no event times. The scenario and phase columns in the output parquet are filled in \emph{after} inference, as analysis metadata only. Four annotator design tricks: (i) sliding $K=6$ window with stride 3, so each frame is averaged across two windows; (ii) ordinal soft distribution $p=[p_1,\dots,p_5]$ summing to 1, preserving uncertainty for downstream KL distillation; (iii) per-window natural-language rationale (one sentence per call), enabling spot-checks; (iv) causal EMA smoothing ($\tau = 0.6$\,s) producing a real-time-style score at $\sim$2\,Hz.
+
+\subsection{Student}
+
+\textbf{MobileNetV3-Small} with a single-scalar regression head, \textbf{1.58\,M parameters}, ingesting one RGB frame and emitting a 0--100 comfort score --- no depth, no temporal context, no phase signal. \textbf{Headline efficiency:} $70\,\text{M}\,/\,1.58\,\text{M} \approx 44\times$ parameter compression.
+
+\textbf{Split.} The distillation corpus merges the 31 calibration recordings with 26 additional bags collected in a second session (2026-05) for a total of \textbf{57 bags}. \code{splits/v2.json} (\code{scripts/make\_v2\_split.py}, seed 42) draws \textbf{47 train / 10 test} from this pool, with 2 test bags per scenario sampled from both sessions so the held-out test contains an explicit \emph{cross-session} component the calibration set never saw.
+
+\textbf{Training.} Huber loss against the heuristic teacher's per-frame score, 10 epochs, frame subsampling at 5\,FPS, JPEG-cached frames preprocessed via standard MobileNet pipeline.
+
+\subsection{Results: three-way agreement on the held-out 10 bags}
+
+Table~\ref{tab:distill} reports pairwise MAE (0--100 scale) and Pearson $r$ between heuristic (H), VLM (V), and student (S) per-bag, then aggregated.
+
+\begin{table}[h]
+\centering
+\caption{Three-way agreement on the 10 held-out test bags. ``in-session'' = 2026-04 recordings (5 bags, same session as part of the calibration corpus); ``cross-session'' = 2026-05 recordings (5 bags, a session not seen during calibration). MAE on 0--100; $r$ is Pearson correlation of the per-frame trajectory.}
+\label{tab:distill}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+split & $n$ & H$\leftrightarrow$V (MAE / $r$) & S$\leftrightarrow$H (MAE / $r$) & S$\leftrightarrow$V (MAE / $r$) \\
+\midrule
+all test bags          & 10 & 27.7 / \textbf{0.74} & \textbf{4.1 / 0.80} & 28.4 / 0.75 \\
+2026-04 (in-session)   & 5  & 27.1 / 0.79          & 2.9 / 0.93          & 27.3 / 0.80 \\
+2026-05 (cross-session)& 5  & 28.3 / 0.69          & 5.5 / 0.68          & 29.5 / 0.70 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Three findings.} (1) \textbf{The student is a faithful copy of the heuristic} (S$\leftrightarrow$H MAE 4.1 / $r$ 0.80 overall). One frame, no depth, no phase, $44\times$ fewer parameters, and the per-frame trajectory still tracks the multimodal teacher closely. (2) \textbf{Heuristic and VLM agree on trajectory direction} ($r = 0.74$) but \textbf{disagree on absolute level}: VLM systematically scores $\sim$20 points lower across all bags. This is a real calibration gap (not noise) --- shape agreement is what defends the student against having learned a scenario-leakage shortcut, but the level gap is a genuine open question about which signal should drive the controller. (3) \textbf{Cross-session generalization gap is real}: every pairwise number degrades on the 2026-05 bags, including S$\leftrightarrow$H MAE 2.9$\to$5.5 and $r$ 0.93$\to$0.68. The student inherits the distribution shift the teacher inherits from its perception backbones.
+
+\subsection{Methodological note: V2 (leaky) $\to$ V3 (clean) flipped the narrative}
+
+Our first iteration of this experiment (V2) used \code{gpt-4.1-mini} with a prompt that fed the VLM scenario name, event-anchored priors, and phase timing as ``context.'' On the same 10 test bags it reported \textbf{H$\leftrightarrow$V Pearson $r = -0.10$}: the two teachers appeared to disagree. The temptation was to write that up as ``a heuristic-vs-VLM disagreement is informative.'' Replacing leakage with raw frames + timestamps only \emph{and} upgrading to \code{gpt-5.5} jumped H$\leftrightarrow$V to $r = +0.74$ (Table~\ref{tab:v2v3}). On sc04 (sudden withdrawal) the change is starkest: leaky V2 scored the withdrawal bags at $\sim$60/100 with negative correlation to the heuristic; clean V3 scores them at 28--33 \emph{and} tracks the downward trajectory ($r = 0.63$ and $0.93$). The V2 ``disagreement'' was almost entirely an artifact of leakage plus a weaker model --- a methodologically important negative-then-positive result we preserve in \code{V2\_TEST\_REPORT.md} alongside V3.
+
+\begin{table}[h]
+\centering
+\caption{V2 (leaky prompt, gpt-4.1-mini) vs.\ V3 (no-leakage prompt, gpt-5.5) on the same 10 test bags.}
+\label{tab:v2v3}
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+ & V2 (leaky, gpt-4.1-mini) & V3 (clean, gpt-5.5) \\
+\midrule
+H$\leftrightarrow$V Pearson $r$ (all)           & $-0.10$ & $\mathbf{+0.74}$ \\
+H$\leftrightarrow$V $r$ on 2026-04              & $+0.08$ & $+0.79$ \\
+H$\leftrightarrow$V $r$ on 2026-05              & $-0.28$ & $+0.69$ \\
+sc04 VLM mean (two withdrawal bags)             & 60.0 / 59.8 & 33.4 / 28.8 \\
+sc04 H$\leftrightarrow$V $r$ (two bags)         & $-0.47$ / $-0.72$ & $+0.63$ / $+0.93$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{What the distillation does and does not show}
+
+10 bags is suggestive, not conclusive. The student cannot see depth, history, or phase --- the lost information is the source of the residual MAE 4.1. Distillation does not validate the teacher; the VLM judge defends only against scenario-artifact leakage, not against a miscalibrated fusion teacher. The 20-point H$\leftrightarrow$V level gap is unresolved: trust the VLM and the heuristic is over-scoring; trust the heuristic and the VLM is harsh. What the recipe \emph{does} show is a practical pattern: heavy multimodal teacher + on-site few-shot calibration $\to$ dense labels $\to$ edge-deployable student that tracks the teacher (MAE 4.1 / $r$ 0.80) and agrees with an information-restricted independent judge on trajectory direction ($r$ 0.74--0.75), inverting the usual ML practice of requiring a large labeled dataset before training anything small.
+
+%% ===================================================================
+\section{Conclusion and Future Directions}
+%% ===================================================================
+
+\textbf{Contributions.} A real-time multimodal comfort-scoring pipeline that fuses pretrained facial-emotion, gaze, and pose models into a single phase-aware score, with cached-feature calibration that iterates the 20-D fusion vector in seconds. Calibrated against 31 RealSense recordings, the system achieves $J = 1.0$ at $\tau^\star = 78$ on held-out test and 90\% LORO slope-sign agreement, against 0.00\,/\,55\% under the hand-tuned default. We document a negative finding --- under our domain conditions, MediaPipe's pose domain shift makes posture net-harmful, and a no-pose ablation beat its parent on every meaningful metric. We then demonstrated a practical path from the heavy multimodal teacher ($\sim$70\,M params, GPU-tethered) to a 1.58\,M-param MobileNetV3-Small student that tracks the teacher at MAE 4.1 / $r = 0.80$, validated against an independent GPT-5.5 VLM judge ($r = 0.74$ on per-frame trajectory, after removing scenario/phase leakage that had previously made the same judge appear to disagree).
+
+\textbf{Takeaways.} (i) Dataset design and phase-aware labeling matter more than dataset size when calibrating fusion; (ii) leveraging pre-existing unimodal models with phase-aware labeling and few-shot calibration is enough to extend perception to a new functional definition without a large task-specific dataset; (iii) an optimized late-fusion model is a credible supervisor for a much smaller edge-deployable student.
+
+\textbf{Limitations.} Small corpus ($n=31$ calibration, $n=8$ held-out; 47/10 for distillation). Five scenarios, one room, one camera mount. The level/shape trade we exposed in \S\ref{sec:race} reflects our budget more than the method. The distillation inherits the teacher's calibration choices: if the teacher's $w_p = 0$ is wrong for a future site, the student faithfully reproduces it. The cross-session generalization gap (Table~\ref{tab:distill}: 2026-04 in-session $r$ 0.93 vs.\ 2026-05 cross-session $r$ 0.68) is the most actionable limitation --- the student degrades on a recording session not used for calibration. The 20-point H$\leftrightarrow$V level gap is unresolved.
+
+\textbf{Future directions.} (1) Recover pose under domain shift via hysteresis/dwell-time gating on withdrawal/mouth-cover triggers and site-specific few-shot fine-tuning of the depth thresholds. (2) Close the perception-to-action loop by wiring \code{live\_comfort.py} into the manipulator's controller. (3) Restore the three-tier continue/slow/abort policy with a second threshold $\tau_\text{slow}$. (4) Double the corpus to $\sim$60 recordings to split sc03/sc05 into named-class targets and tighten the Youden CI. (5) On-site few-shot recalibration as a one-command per-deployment routine given the cached-feature pipeline. (6) Deploy the student of \S\ref{sec:distill} on the robot's onboard compute and re-run the live comparison.
+
+%% ===================================================================
+% References --- unlimited pages allowed per the course instructions
+%% ===================================================================
+\bibliographystyle{plain}
+
+\begin{thebibliography}{99}
+
+\bibitem{ref01} N. Churamani, P. Barros, H. Gunes, and S. Wermter. Affect-driven modelling of robot personality for collaborative human--robot interactions. \emph{arXiv:2010.07221}, 2020.
+
+\bibitem{ref02} T. Wang, P. Zheng, S. Li, and L. Wang. Multimodal human--robot interaction for human-centric smart manufacturing: A survey. \emph{Advanced Intelligent Systems}, 6(1):2300359, 2024.
+
+\bibitem{ref03} H. Su, W. Qi, J. Chen, C. Yang, J. Sandoval, and M. A. Laribi. Recent advancements in multimodal human--robot interaction. \emph{Frontiers in Neurorobotics}, 17:1084000, 2023.
+
+\bibitem{ref04} X. Zhao et al. Multimodal perception-driven decision-making for human--robot interaction: A survey. \emph{Frontiers in Robotics and AI}, 12:1604472, 2025.
+
+\bibitem{ref05} Y. Yan and Y. Jia. A review on human comfort factors, measurements, and improvements in human--robot collaboration. \emph{Sensors}, 22(19):7431, 2022.
+
+\bibitem{ref06} Y. Yan, H. Su, and Y. Jia. Modeling and analysis of human comfort in human--robot collaboration. \emph{Biomimetics}, 8(6):464, 2023.
+
+\bibitem{ref07} M. Lorenzini et al. Ergonomic human--robot collaboration in industry: A review. \emph{Frontiers in Robotics and AI}, 9:813907, 2023.
+
+\bibitem{ref08} P. Gonzalez-Santocildes et al. Adaptive robot behavior based on human comfort using reinforcement learning. \emph{IEEE Access}, 12, 2024.
+
+\bibitem{ref09} J. S. Heinisch et al. Physiological data for affective computing in HRI with anthropomorphic service robots: The AFFECT-HRI dataset. \emph{Scientific Data}, 11(1):333, 2024.
+
+\bibitem{ref10} M. Spezialetti, G. Placidi, and S. Rossi. Emotion recognition for human--robot interaction: Recent advances and future perspectives. \emph{Frontiers in Robotics and AI}, 7:532279, 2020.
+
+\bibitem{ref11} I. T. Freire, X. Arrieta Gonzalez, A. F. Amil, and P. F. M. J. Verschure. Socially adaptive cognitive architecture for human--robot collaboration in industrial settings. \emph{Frontiers in Robotics and AI}, 11:1248646, 2024.
+
+\bibitem{ref12} H. Abdollahi et al. Artificial emotional intelligence in socially assistive robots for older adults: A pilot study. \emph{IEEE Trans. Affective Computing}, 14(3):2020--2032, 2023.
+
+\bibitem{ref13} J. R. Namba, K. Subramanian, C. Savur, and F. Sahin. Database for human emotion estimation through physiological data in industrial human--robot collaboration. In \emph{Proc. IEEE Int.\ Conf.\ Systems, Man, and Cybernetics (SMC)}, pp. 4901--4907, Honolulu, HI, 2023.
+
+\bibitem{ref14} W. Zheng, B. Wu, and H. Lin. POMDP model learning for human--robot collaboration. In \emph{Proc. IEEE CDC}, pp. 1156--1161, 2018.
+
+\bibitem{ref15} R. Pandya. Influence-aware safety for human--robot interaction. PhD thesis, CMU-RI-TR-25-95, Robotics Institute, Carnegie Mellon University, 2025.
+
+\bibitem{ref16} N. Churamani, P. Barros, H. Gunes, and S. Wermter. Affect-driven learning of robot behaviour for collaborative human--robot interactions. \emph{Frontiers in Robotics and AI}, 9:717193, 2022.
+
+\bibitem{ref17} L. Brunke et al. Safe learning in robotics: From learning-based control to safe reinforcement learning. \emph{Annual Review of Control, Robotics, and Autonomous Systems}, 5:411--444, 2022.
+
+\bibitem{ref18} U. Mamodiya, I. Kishor, A. Ahmed Syed, P. Sankalkar, and N. Naik. An adaptive human--robot interaction framework using real-time emotion recognition and context-aware task planning. \emph{IEEE Access}, 13:111431--111450, 2025.
+
+\bibitem{ref19} Y. Yin, S. Huang, and X. Zhang. BM-NAS: Bilevel multimodal neural architecture search. In \emph{Proc. AAAI Conf.\ Artificial Intelligence}, 36(8):8901--8909, 2022.
+
+\bibitem{ref20} I. Wechsler, J. Shanbhag, N. Schlechtweg, et al. Multimodal inverse kinematics significantly improves IMU-based biomechanical analyses. \emph{Scientific Reports}, 15:44420, 2025.
+
+\bibitem{ref21} D. Driess et al. PaLM-E: An embodied multimodal language model. In \emph{Proc. ICML}, 2023.
+
+\bibitem{ref22} X. Alameda-Pineda et al. SALSA: A novel dataset for multimodal group behavior analysis. \emph{IEEE TPAMI}, 2016.
+
+\bibitem{ref23} D. B. Jayagopi et al. The Vernissage corpus: A multimodal human--robot interaction dataset. In \emph{Proc. LREC}, 2012.
+
+\bibitem{ref24} R. Mart\'in-Mart\'in et al. JRDB: A dataset and benchmark of egocentric robot visual perception of humans in built environments. \emph{IEEE TPAMI}, 2021.
+
+\bibitem{ref25} P. Kellnhofer et al. Gaze360: Physically unconstrained gaze estimation in the wild. In \emph{Proc. ICCV}, 2019.
+
+\bibitem{ref26} A. Mollahosseini, B. Hasani, and M. H. Mahoor. AffectNet: A database for facial expression, valence, and arousal computing in the wild. \emph{IEEE Trans. Affective Computing}, 10(1):18--31, 2019.
+
+\bibitem{ref27} J. Liu et al. NTU RGB+D 120: A large-scale benchmark for 3D human activity understanding. \emph{IEEE TPAMI}, 42(10):2684--2701, 2020.
+
+\bibitem{ref28} C. Busso et al. IEMOCAP: Interactive emotional dyadic motion capture database. \emph{Language Resources and Evaluation}, 42(4):335--359, 2008.
+
+\bibitem{ref29} Y. Tao et al. MMAI Comfort-Handover V3: side-by-side comparison videos and VLM prompt. HuggingFace dataset \code{yirantao1000/mmai-comfort-handover-v3}, 2026. \url{https://huggingface.co/datasets/yirantao1000/mmai-comfort-handover-v3}. Code: project repository, branch \code{yiran/v3-distillation} (\code{V3\_PIPELINE.md}, \code{V3\_TEST\_REPORT.md}).
+
+\bibitem{ref30} J. Y. Kim. Calibration Impact on Comfort Scoring: Before/After Comparison on the Full 31-Recording Corpus. Project repository, \code{reports/calibration\_comparison.\{tex,pdf\}}, 2026.
+
+\end{thebibliography}
+
+%% ===================================================================
+% Appendix (optional supplementary material; not graded per the course
+% instructions, unlimited extra pages allowed)
+%% ===================================================================
+\appendix
+
+\section{Sidecar JSON format}\label{app:sidecar}
+
+Each \code{.bag} recording is paired with a JSON sidecar carrying the keypoints used by the calibration harness to set $\varphi(t)$. For sc02--sc05 (full handover or attempted handover):
+\begin{lstlisting}
+{
+  "scenario_code": "SC-02",
+  "scenario_name": "Comfortable handoff",
+  "duration_seconds": 12.5,
+  "realsense_serial": "838212070352",
+  "labels": {
+    "start_time": 3.04,
+    "signal_time": 4.14,
+    "handover_time": 11.41,
+    "end_time": 15.88
+  }
+}
+\end{lstlisting}
+For sc01 (walk-by, no handover) the structure is \code{(start, signal, abort)} with \code{handover\_time} absent. The labeling tool overwrites \code{labels} post-hoc as the annotator steps through the video and presses S/I/H/E (or A) hotkeys.
+
+\section{Calibration command sequence}\label{app:cmd}
+
+\begin{lstlisting}
+python scripts/calibrate.py split
+    # 75/25 stratified split -> data/split.json
+python scripts/calibrate.py extract
+    # GPU pass; caches per-frame features -> cache/*.parquet
+python scripts/calibrate.py optimize
+    # CPU-only DE on cached features -> config/deploy.yaml
+python scripts/calibrate.py evaluate
+    # held-out test -> reports/calibration_report.json
+\end{lstlisting}
+Once \code{extract} has run, \code{optimize} and \code{evaluate} iterate at CPU speeds. Full DE budget (50 iter $\times$ pop 15) for one objective variant takes $\sim$20\,min single-threaded and trivially parallelizes across variants.
+
+\section{20-dimensional calibration vector and bounds}\label{app:bounds}
+
+\begin{lstlisting}
+theta = (w_e^intent, w_p^intent, w_g^intent,
+         w_e^exec,   w_p^exec,   w_g^exec,
+         yaw_thresh, pitch_thresh, face_cover_ratio,
+         mouth_cover_penalty,
+         withdrawal_thresh_m, withdrawal_penalty,
+         gamma, delta, tau_ema, posture_drop_gate,
+         no_face_target, no_face_rate,
+         no_pose_target, no_pose_rate)
+\end{lstlisting}
+Representative bounds: \code{no\_face\_rate} $\in [0.05, 0.50]$; \code{yaw\_thresh} $\in [15^\circ, 35^\circ]$; \code{pitch\_thresh} $\in [10^\circ, 30^\circ]$; \code{face\_cover\_ratio} $\in [0.4, 0.9]$. Each $w_e^\varphi + w_p^\varphi = 1$ is enforced by softmax-projection of the DE candidate after each generation.
+
+\section{Calibration process documentation in the repository}\label{app:process}
+
+The main paper compresses a two-race calibration sequence into Tables~\ref{tab:race} and \ref{tab:nopose}. The unfiltered working notes are preserved in the repository for any reader who wants the full decision trail:
+
+\begin{itemize}
+  \item \code{reports/20260419\_1124\_calibration\_process\_braindump.md} --- the unedited working narrative: starting point, why $J=1.0$ wasn't the end of the story, the Race~1 trade between the gate-count winner ($J=1.0$ but barely-positive sc02 slope) and the shape-aware finalist (clearly-positive sc02 slope but $J=0.667$), how the hardcoded drag-ceiling problem was diagnosed between races, the 15$\to$20-dim expansion, Race~2 per-variant analysis, the surprise no-pose ablation, default-vs-deploy mechanism, process failures (\code{Path.relative\_to} crash, default report-paths dumping to project root, the 02:30-vs-09:56 wake gap), and an honest list of claims we still wouldn't make.
+  \item \code{reports/calibration\_comparison.tex} (compiled to \code{calibration\_comparison.pdf}) --- the formal calibration-impact writeup: the 31-recording LORO before/after table reproduced from Table~\ref{tab:headline}, the 20-dimensional search-space table grouped by role (fusion weights, sub-score coefficients, gaze cone, posture event detectors, penalties, EMA, missing-detection decay), and the loss derivation (Eq.~\ref{eq:loss}) with a variable-summary table mapping every symbol to its meaning. Authoritative source for the objective.
+  \item \code{reports/RUNS.md} --- the calibration-run index: one row per (config, held-out test metrics) pair across both races, with the seven-gate ranking table, the LORO breakdown for A and A-no-pose, and the archive chain from \code{config/deploy.baseline.yaml} $\to$ \code{config/deploy.prerace.yaml} $\to$ \code{config/deploy.A\_withpose.yaml} $\to$ \code{config/deploy.yaml}.
+  \item \code{reports/default\_vs\_deploy.md} --- the head-to-head writeup of \code{default.yaml} vs.\ the calibrated \code{deploy.yaml}: full parameter-by-parameter table of what changed, the three-mechanism explanation, per-scenario level and slope deltas on both test and LORO, and the bottom-line that the default config produces the \emph{wrong ordering} and the \emph{wrong trajectory direction}, not merely a suboptimal threshold.
+\end{itemize}
+
+These documents are part of the repository deliverable per the course's GitHub-repository requirement, not appendix figures of this paper; they are referenced here so reviewers can audit any specific design decision against the working record without recovering it from \code{git log}.
+
+\section{Repository structure}\label{app:repo}
+
+\begin{lstlisting}
+src/
+  pipeline.py     # IntegratedPipeline orchestrating branches
+  comfort.py      # IntegratedComfortScorer
+                  #   (phase-aware fusion + EMA + decay)
+  phases.py       # PHASES, PhaseWindows, sidecar JSON parsing
+  detectors/      # face / emotion / gaze / pose adapters
+  visualization.py# HUD overlay
+  bag_source.py   # RealSense .bag playback abstraction
+scripts/
+  calibrate.py        # entry point for the four-stage pipeline
+  extract_features.py # Stage A: GPU pass, caches parquets
+  optimize_params.py  # Stage B: differential evolution
+  evaluate_test.py    # Stage C: held-out test
+  loro_eval.py        # full-corpus LORO sweep
+  race_objectives.py  # parallel race over objective variants
+  run_bag.py          # interactive playback of a recording
+  live_comfort.py     # reference live deployment
+config/
+  default.yaml        # hand-tuned baseline (never calibrated)
+  deploy.yaml         # calibrated A-no-pose winner (deployed)
+  deploy.{A_withpose,prerace,baseline,
+          A,B,C,F,G,H,I}.yaml   # archived variants
+reports/
+  default_vs_deploy.md             # head-to-head writeup
+  RUNS.md                          # index of every run
+  20260419_1124_calibration_process_braindump.md
+  eval_*.json, loro_*.json,
+  *_race*.{yaml,json}              # raw outputs
+\end{lstlisting}
+
+\end{document}

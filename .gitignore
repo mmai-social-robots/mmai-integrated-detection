@@ -16,3 +16,8 @@ rendering_output/
 outputs/
 cache/
 .claude/
+
+# Binary deliverables — shared via cloud storage, not git
+*.pptx
+*.docx
+.DS_Store
