@@ -84,9 +84,11 @@ the categorical decision is correct even on the disagreeing recordings.
 \paragraph{The headline number.}
 Best Youden's $J$ on the held-out test set ($n{=}8$, including 3 aborts)
 goes from $0.00$ at any threshold $\tau \in [30, 80]$ under default to
-$1.00$ at $\tau \in [55, 68]$ under deploy --- the default configuration
-cannot separate abort from continue \emph{at any threshold}, while deploy
-yields a wide margin window for the controller to operate in.
+$1.00$ across the plateau $\tau \in [78, 80]$ under deploy (deployed at the
+conservative upper edge $\tau^{*} = 80$). The default configuration cannot
+separate abort from continue \emph{at any threshold} in the swept range,
+while deploy clears the plateau by a wide margin --- the two held-out sc02
+recordings score 91.6 and 94.0, well above $\tau^{*}$.
 
 \clearpage
 \section*{Optimization Search Space}
