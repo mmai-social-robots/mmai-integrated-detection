@@ -85,7 +85,7 @@ Despite progress in multimodal perception and comfort measurement, prior work ha
 
 In this paper, we treat \emph{fusion} --- not the unimodal models --- as the surface on which we learn. We segment each handover into three phases (approach, intent signaling, service execution) and learn phase-specific fusion weights from a small RealSense D435 dataset by differential evolution against a Youden-$J$ abort-decision objective. The calibrated config drives a binary continue/abort policy at a fixed threshold $\tau^\star$. We then address a fourth gap --- \textbf{edge deployability} --- by treating the calibrated pipeline ($\sim$70\,M params across four backbones, GPU-tethered) as a \emph{teacher} that labels every frame of every recording, then training a 1.58\,M-param MobileNetV3-Small~\cite{mobilenetv3} \emph{student} via Huber regression~\cite{distillation} to reproduce the score from a single RGB frame.
 
-Contributions: (i) a phase-aware late-fusion comfort scorer with EMA smoothing and missing-detection decay, deployable with zero retraining of perception models; (ii) a four-stage calibration pipeline (split $\to$ cached feature extraction $\to$ DE optimize $\to$ held-out evaluate) where optimization runs in seconds per configuration on cached features; (iii) experimental evidence that, under our domain conditions, posture --- despite a clear standalone signal --- is net-harmful to the fusion: an \emph{ablation that beat its parent variant}, with a mechanism-level explanation; (iv) a teacher--student distillation showing that the calibrated comfort signal supervises a $44\times$-smaller single-RGB-frame student, cross-checked against an independent VLM-as-judge as a scenario-leakage control (not a validity check on the teacher).
+Contributions: (i) a \emph{deployment recipe} --- a phase-aware late-fusion comfort scorer built atop four frozen pretrained unimodal models, calibrated from a small ($n=31$), low-effort RGB-D dataset with four-keypoint sidecar-JSON phase labels, no perception-model fine-tuning required --- showing that off-the-shelf vision models plus minimal site-specific labeling are sufficient to produce a deployment-effective comfort signal; (ii) a cached-feature calibration pipeline that turns each candidate evaluation into seconds of CPU rather than minutes of GPU, enabling rapid on-site recalibration when lighting, camera, or user population shifts; (iii) experimental evidence that, under our domain conditions, posture --- despite a clear standalone signal --- is net-harmful to the fusion: an \emph{ablation that beat its parent variant}, with a mechanism-level explanation; (iv) a teacher--student distillation showing that the calibrated comfort signal supervises a $44\times$-smaller single-RGB-frame student, cross-checked against an independent VLM-as-judge as a scenario-leakage control (not a validity check on the teacher).
 
 %% ===================================================================
 \section{Related Work}
@@ -172,9 +172,7 @@ When a channel is missing on a given frame, $\tilde{C}_k^{(t)} \leftarrow \tilde
 
 \subsection{Calibration via differential evolution on cached features}
 
-The learning surface is a 20-dimensional fusion vector $\theta$; five entries --- the four (target, rate) pairs for missing-face/missing-pose decay and \code{posture\_drop\_gate} --- were promoted from hardcoded runtime constants after midterm analysis identified the slow \code{no\_face\_rate}~$=0.15/\text{s}$ as a drag ceiling on calibration (\S\ref{sec:mechanism}). Growing the search from 15 to 20 dimensions proved decisive.
-
-The remaining 15 entries cover the phase-aware fusion weights $w_e^\varphi, w_p^\varphi$ for $\varphi \in \{\text{intent},\text{exec}\}$ (rescaled to sum to 1 at use), the in-emotion gaze coefficient $w_g^\varphi$ for the same two phases (a coefficient inside Eq.~3, \emph{not} a fusion weight at the same level as $w_e, w_p$), the gaze cone (yaw/pitch), \code{face\_cover\_ratio}, the two penalty magnitudes, \code{withdrawal\_thresh\_m}, $\gamma$, $\delta$, and $\tau_\text{ema}$ (full bounds in Appendix~\ref{app:bounds}). Approach-phase fusion weights are held fixed at defaults ($w_e = w_p = 0.5$, $w_g = 0.3$) and excluded from $\theta$, since the approach window contributes only a small fraction of frames per recording.
+The learning surface is a 20-dimensional fusion vector $\theta$ covering the phase-aware fusion weights $w_e^\varphi, w_p^\varphi$ for $\varphi \in \{\text{intent}, \text{exec}\}$ (rescaled to sum to 1), the in-emotion gaze coefficient $w_g^\varphi$ (a coefficient inside Eq.~3, \emph{not} a fusion weight at the same level as $w_e, w_p$), the gaze cone, two penalty magnitudes, $\gamma$, $\delta$, $\tau_\text{ema}$, and the EMA / missing-detection-decay constants. Approach-phase weights are held fixed at defaults; full bounds in Appendix~\ref{app:bounds}.
 
 The pipeline has four stages (split / extract / optimize / evaluate; Appendix~\ref{app:cmd}): \code{extract} runs the four perception models once per recording, caching per-frame features as parquets so that \code{optimize} replays from cache in pure NumPy under \code{scipy.optimize.differential\_evolution} on the cross-validated loss below.
 
@@ -186,11 +184,9 @@ The training set is split into $K=5$ label-stratified folds. For each held-out f
 \begin{equation}
 \mathcal{L}_A(\theta) = -\Bigl[\,\bar{J}(\theta) + \varepsilon \cdot \tfrac{\mu_\text{sc02}(\theta) - \mu_\text{sc01}(\theta)}{100}\,\Bigr],\quad \varepsilon = 0.1, \label{eq:loss}
 \end{equation}
-pairing the primary classification term $\bar{J}$ with a small sc02-vs-sc01 mean-margin tie-breaker over training-set scenario means $\mu_\text{sc02}, \mu_\text{sc01}$. Differential evolution~\cite{de1997} settings: $\text{popsize}=15$ (= 300 candidates per generation), $\text{maxiter}=50$, $\text{tol}=10^{-3}$, deferred whole-generation updating, final L-BFGS-B polish, seed 42. DE is gradient-free, which is required because $\bar{J}$ is rank-based and non-differentiable in $\theta$. The full equation, derivation, and parameter-bound table are in \code{reports/calibration\_comparison.tex}~\cite{ref30}.
+pairing the classification term $\bar{J}$ with a sc02-vs-sc01 mean-margin tie-breaker. DE is gradient-free, required because $\bar{J}$ is rank-based and non-differentiable in $\theta$; full hyperparameters, the 20-D bound table, and the search-space derivation are in Appendix~\ref{app:bounds} and~\cite{ref30}.
 
-Trajectory shape is an evaluation gate, not part of the loss. Whether $\tilde{C}_t$ trends up or down within a recording does not enter Eq.~\eqref{eq:loss}. Per-scenario slope-sign agreement is computed \emph{after} the search as one of seven pre-registered acceptance gates (\S\ref{sec:race}). The shape-aware objective variants we tried (F/G/H/I, \S\ref{sec:race}) \emph{replaced} $\bar{J}$ with tanh-encoded slope terms, $\text{shape} = \tanh(3\hat\beta W / 100) \in [-1, +1]$ for the linear-fit slope $\hat\beta$ (comfort-points per second) over window width $W$ (seconds); all four lost to variant~A.
-
-Calibration ran in two rounds: \textbf{Race 1} (15-dim, four variants, cheap budget) put A against a mean-of-last-30\% shape-aware variant: A landed $J=1.0$ but with a slightly-\emph{negative} sc02 slope ($-0.10$, wrong direction), while the shape-aware variant got a clearly-positive sc02 slope ($+0.93$) but $J=0.667$ (below the $J\ge 0.80$ gate). Neither cleared every gate and the failure pattern surfaced the drag-ceiling issue diagnosed above. \textbf{Race 2} added the five new tunables, the six objective variants (A, C, F, G, H, I), and full DE budget run in parallel across a 23-core machine.
+Trajectory shape is an \emph{evaluation gate} (\S\ref{sec:race}), not part of the loss: shape-aware objective variants we tried (F/G/H/I) replaced $\bar{J}$ with tanh-encoded slope terms and all lost to variant~A.
 
 \subsection{Inference}
 
@@ -281,15 +277,7 @@ I          & sc02-weighted ($\times 3$) tanh slope + sign penalty         & $+0.
 \end{tabular}}
 \end{table}
 
-Each variant fails a specific way:
-\begin{itemize}
-  \item \textbf{C} (delta reducer replaces $\bar J$): satisfies ``sc02 delta positive'' by lifting sc02 alone, parking other scenarios near $\tau$ --- sc02 mean collapses to 65.8.
-  \item \textbf{F} ($\bar J$ + sc02-only tanh slope): lifts \emph{every} scenario uniformly (sc01 slope $+2.88$, sc04 slope $+1.48$) --- Goodhart, since nothing in the loss penalizes a rising sc01.
-  \item \textbf{G} ($\bar J$ + all-scenario \emph{mean} tanh slope): mean-aggregation sacrifices the sc02 minority --- sc01/sc03/sc04/sc05 fall steeply ($-2.4$ to $-3.5$) while sc02 drifts to $-0.75$.
-  \item \textbf{H} (G's objective on the 20-dim space): same failure persists, isolating the cause to objective \emph{geometry}, not parameter-space dimensionality.
-  \item \textbf{I} (sc02-weighted $3\times$ tanh slope + sign penalty): fixes sc02 ($+0.89$) but sc01 drifts up to $+2.61$, since DE relaxes the unguarded scenario.
-  \item \textbf{A} (level-only baseline + margin): strongest gate-count winner. The one gate it misses --- sc04 $\mu \le 65$ (actual 77.6) --- is arguably mis-specified, since the abort ROC is perfect ($J=1.0$ across the $\tau \in [78,80]$ plateau, deployed at $\tau^\star=80$) and sc04's slope ($-2.82$) is correctly steep.
-\end{itemize}
+Each shape-aware variant trades one scenario's correctness for another's (Table~\ref{tab:race}): C lifts sc02 alone by collapsing the level scale; F and G each force one scenario's slope sign at the cost of another's; H runs G's objective on the 20-D space and reproduces the same failure, isolating the cause to objective \emph{geometry} rather than search dimensionality; I corrects sc02 but lets sc01 drift positive. Variant A --- level-only baseline plus mean-margin --- wins 6 of 7 gates; its single miss is sc04 $\mu = 77.6$ (vs the $\le 65$ threshold), but the abort ROC at $\tau^\star=80$ is perfect and sc04's slope ($-2.82$) is correctly steep, so the failed gate does not harm deployment.
 
 The negative result: under this train budget (23 recordings, 5-fold CV), single-objective DE cannot simultaneously satisfy \emph{level} and \emph{shape} gates without overcorrecting on some scenario. We promote A and expose the trade-off; the post-hoc no-pose ablation (\S\ref{sec:nopose}) recovers correct sc02 trajectory direction without changing $J$.
 
@@ -329,6 +317,8 @@ Three coupled changes account for the default-to-deploy transformation:
 \end{enumerate}
 
 Smaller supporting changes: \code{face\_cover\_ratio} $0.6 \to 0.85$, \code{withdrawal\_penalty} $25 \to 11.9$, $\gamma$~$0.5 \to 0.11$, $\delta$~$0.3 \to 0.006$, $\tau_\text{ema}$~$0.5 \to 0.286$.
+
+Taken together, these three mechanism-level changes show that a 31-recording phase-labeled site corpus, combined with frozen pretrained unimodal backbones and a low-dimensional learned fusion layer, is sufficient to convert generic perception models into a deployment-specific comfort scorer --- without any backbone fine-tuning and without a large training set.
 
 %% ===================================================================
 \section{Edge Deployment}\label{sec:distill}
